@@ -364,7 +364,7 @@ def create_prices(morpheus_api: MorpheusApiClient):
     logger.info("--- Price creation complete. ---")
 
 def create_price_sets(morpheus_api: MorpheusApiClient):
-    """Step 4: Create comprehensive price sets from prices in Morpheus - FIXED VERSION FOR EVERYTHING PRICE SETS WITH STORAGE."""
+    """Step 4: Create comprehensive price sets from prices in Morpheus - FIXED VERSION FOR COMPONENT PRICE SETS WITH STORAGE."""
     logger.info(f"--- Step 4: Creating Price Sets in Morpheus ---")
     if not os.path.exists(LOCAL_SKU_CACHE_FILE):
         logger.error(f"Local cache file '{LOCAL_SKU_CACHE_FILE}' not found. Please run 'sync-gcp-data' and 'create-prices' first.")
@@ -433,7 +433,7 @@ def create_price_sets(morpheus_api: MorpheusApiClient):
             data["prices"].update(storage_prices[region_key])
             data["price_types"].add("storage")
 
-    logger.info(f"Processing {len(machine_family_prices)} comprehensive price sets (Everything type with storage)...")
+    logger.info(f"Processing {len(machine_family_prices)} comprehensive price sets (Component type with storage)...")
     logger.info("Each price set includes cores, memory, and storage pricing for complete VM provisioning")
     
     for i, (key, data) in enumerate(machine_family_prices.items()):
@@ -453,12 +453,12 @@ def create_price_sets(morpheus_api: MorpheusApiClient):
             missing_types = required_types - data['price_types']
             logger.warning(f"  Warning: Missing price types {missing_types} for comprehensive pricing")
         
-        # FIXED: Correct price set payload structure for "Everything" price sets
+        # FIXED: Correct price set payload structure for "Component" price sets
         payload = {
             "priceSet": {
                 "name": data["name"], 
                 "code": data["code"], 
-                "type": "fixed",  # Use 'fixed' type
+                "type": "component",  # Use 'component' type instead of 'fixed'
                 "priceUnit": "hour",  # Add required priceUnit
                 "regionCode": PRICE_PREFIX.lower(),  # Add regionCode
                 "prices": [{"id": price_id} for price_id in data["prices"]]  # Proper price structure
