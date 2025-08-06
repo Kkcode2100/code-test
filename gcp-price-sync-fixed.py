@@ -257,7 +257,7 @@ def create_prices(morpheus_api: MorpheusApiClient):
     logger.info("--- Price creation complete. ---")
 
 def create_price_sets(morpheus_api: MorpheusApiClient):
-    """Step 4: Create price sets from prices in Morpheus - FIXED VERSION."""
+    """Step 4: Create price sets from prices in Morpheus - FIXED VERSION FOR SEPARATE PRICE TYPES."""
     logger.info(f"--- Step 4: Creating Price Sets in Morpheus ---")
     if not os.path.exists(LOCAL_SKU_CACHE_FILE):
         logger.error(f"Local cache file '{LOCAL_SKU_CACHE_FILE}' not found. Please run 'sync-gcp-data' and 'create-prices' first.")
@@ -275,26 +275,32 @@ def create_price_sets(morpheus_api: MorpheusApiClient):
     price_id_map = {p['code']: p['id'] for p in all_prices_resp['prices']}
     price_set_groups = {}
     
-    # Group prices by machine family and region
+    # FIXED: Group prices by machine family, price type, AND region separately
+    # This avoids the "Everything" price set error by creating separate price sets per type
     for price_info in pricing_data:
         family = price_info.get('machine_family', 'unknown')
+        price_type = price_info.get('priceTypeCode', 'unknown')
+        
         if family == 'software': continue  # Don't create price sets for generic software
         
         region = price_info['region'].replace('-', '_')
-        group_key = f"gcp-{family}-{region}"
+        # FIXED: Include price type in the group key to create separate price sets
+        group_key = f"gcp-{family}-{price_type}-{region}"
         
         if group_key not in price_set_groups:
             price_set_groups[group_key] = {
-                "name": f"{PRICE_PREFIX} - GCP - {family.upper()} ({price_info['region']})",
+                "name": f"{PRICE_PREFIX} - GCP - {family.upper()} - {price_type.title()} ({price_info['region']})",
                 "code": f"{PRICE_PREFIX.lower()}.{group_key}",
-                "prices": set()
+                "prices": set(),
+                "priceType": price_type
             }
         
         price_id = price_id_map.get(price_info['morpheus_code'])
         if price_id:
             price_set_groups[group_key]["prices"].add(price_id)
 
-    logger.info(f"Processing {len(price_set_groups)} price sets...")
+    logger.info(f"Processing {len(price_set_groups)} price sets (separated by price type)...")
+    logger.info("This creates separate price sets for each price type to avoid 'Everything' validation errors")
     
     for i, (key, data) in enumerate(price_set_groups.items()):
         sys.stdout.write(f"\rProcessing price set {i + 1}/{len(price_set_groups)}: {data['name']}")
