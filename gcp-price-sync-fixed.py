@@ -157,20 +157,40 @@ class GCPPricingClient:
         
         price_type_code = 'software'
         machine_family_heuristic = 'software'
+        description = sku_dict.get('description', '').lower()
+        
         if resource_family == "COMPUTE":
             if resource_group == "CPU": 
                 price_type_code = 'cores'
                 # Extract family from description, e.g., "N2 CPU..." -> "n2"
-                family_match = re.search(r'^([A-Z0-9]+)', sku_dict.get('description', ''))
+                family_match = re.search(r'^([A-Z0-9]+[A-Z]?)', sku_dict.get('description', ''))
                 if family_match: machine_family_heuristic = family_match.group(1).lower()
             elif resource_group == "RAM": 
                 price_type_code = 'memory'
-                family_match = re.search(r'^([A-Z0-9]+)', sku_dict.get('description', ''))
+                family_match = re.search(r'^([A-Z0-9]+[A-Z]?)', sku_dict.get('description', ''))
                 if family_match: machine_family_heuristic = family_match.group(1).lower()
         elif resource_family == "STORAGE":
             if resource_group == "DISK": 
                 price_type_code = 'storage'
-                machine_family_heuristic = 'pd-standard'
+                # FIXED: Better disk type detection from description
+                if 'ssd' in description and 'local' in description:
+                    machine_family_heuristic = 'local-ssd'
+                elif 'hyperdisk' in description and 'balanced' in description:
+                    machine_family_heuristic = 'hyperdisk-balanced'
+                elif 'hyperdisk' in description and 'extreme' in description:
+                    machine_family_heuristic = 'hyperdisk-extreme'
+                elif 'pd-extreme' in description or 'extreme' in description:
+                    machine_family_heuristic = 'pd-extreme'
+                elif 'pd-balanced' in description or 'balanced' in description:
+                    machine_family_heuristic = 'pd-balanced'
+                elif 'pd-ssd' in description or ('ssd' in description and 'persistent' in description):
+                    machine_family_heuristic = 'pd-ssd'
+                elif 'regional' in description and 'ssd' in description:
+                    machine_family_heuristic = 'regional-pd-ssd'
+                elif 'regional' in description:
+                    machine_family_heuristic = 'regional-pd-standard'
+                else:
+                    machine_family_heuristic = 'pd-standard'
         
         usage_unit_desc = pricing_info.get('pricingExpression', {}).get('usageUnitDescription', '').lower()
         price_unit = 'month' if 'month' in usage_unit_desc else 'hour'
@@ -188,13 +208,67 @@ class GCPPricingClient:
 # --- Modular Functions ---
 
 def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
-    """Step 1: Discover Google service plans from Morpheus."""
+    """Step 1: Discover Google service plans from Morpheus - FIXED TO FILTER ONLY GCP PLANS."""
     logger.info("--- Step 1: Discovering Morpheus Service Plans ---")
     plans = morpheus_api.get("service-plans?provisionTypeCode=google&max=1000")
-    service_plans = plans.get('servicePlans', []) if plans else []
-    logger.info(f"Found {len(service_plans)} GCP Service Plans in Morpheus.")
+    all_plans = plans.get('servicePlans', []) if plans else []
+    
+    # FIXED: Filter to only include actual GCP machine types, exclude non-GCP plans
+    gcp_patterns = [
+        r'^[a-z]\d+[a-z]?-',  # Standard GCP patterns like e2-, n2-, c2-, etc.
+        r'^f1-micro$', r'^g1-small$',  # Legacy GCP types
+        r'^[a-z]\d+-custom',  # Custom machine types
+    ]
+    
+    service_plans = []
+    excluded_count = 0
+    
+    for plan in all_plans:
+        plan_name = plan.get('name', '').lower()
+        is_gcp_plan = any(re.match(pattern, plan_name) for pattern in gcp_patterns)
+        
+        # Additional filtering - exclude obvious non-GCP plans
+        exclude_patterns = [
+            'azure', 'rds db.', 'aks ', 'eks ', 'gke controller', 'hyper-v', 
+            'default', 'discovered', 'terraform', 'workflow',
+            'controller', 'stack', 'external', 'manual', 'kubernetes',
+            'dtus', 'ioh vm', ' cpu,', ' memory,', ' storage'
+        ]
+        
+        is_excluded = any(pattern in plan_name for pattern in exclude_patterns)
+        
+        if is_gcp_plan and not is_excluded:
+            service_plans.append(plan)
+        else:
+            excluded_count += 1
+    
+    logger.info(f"Found {len(service_plans)} actual GCP Service Plans (excluded {excluded_count} non-GCP plans)")
+    logger.info("GCP Service Plans detected:")
+    
+    # Group by machine family for better visibility
+    family_groups = {}
     for p in sorted(service_plans, key=lambda x: x['name']):
-        print(f" - {p['name']}")
+        name = p['name'].lower()
+        family = 'unknown'
+        
+        # Extract family from plan name
+        for pattern in [r'^([a-z]\d+[a-z]?)-', r'^(f1|g1)-']:
+            match = re.match(pattern, name)
+            if match:
+                family = match.group(1)
+                break
+        
+        if family not in family_groups:
+            family_groups[family] = []
+        family_groups[family].append(p['name'])
+    
+    for family, plans_list in sorted(family_groups.items()):
+        logger.info(f"  {family.upper()} family: {len(plans_list)} plans")
+        for plan_name in sorted(plans_list)[:3]:  # Show first 3 as examples
+            print(f"   - {plan_name}")
+        if len(plans_list) > 3:
+            print(f"   - ... and {len(plans_list) - 3} more {family} plans")
+    
     return service_plans
 
 def sync_gcp_data(morpheus_api: MorpheusApiClient, gcp_client: GCPPricingClient):
@@ -205,15 +279,48 @@ def sync_gcp_data(morpheus_api: MorpheusApiClient, gcp_client: GCPPricingClient)
         logger.warning("No GCP service plans found in Morpheus. Nothing to sync.")
         return
 
+    # FIXED: Extract machine families from actual GCP plan names and include all disk types
     filters = set()
+    detected_families = set()
+    
     for plan in plans:
         name = plan.get('name', '').lower()
-        match = re.search(r'(e2|n1|n2|c2|m1|m2)-[a-z]+-[0-9]+', name)
-        if match:
-            family = match.group(1)
+        family = None
+        
+        # More comprehensive pattern matching for GCP machine families
+        patterns = [
+            r'^([a-z]\d+[a-z]?)-',  # e2-, n2-, c2-, n2d-, c2d-, etc.
+            r'^(f1|g1)-',           # Legacy types
+        ]
+        
+        for pattern in patterns:
+            match = re.match(pattern, name)
+            if match:
+                family = match.group(1)
+                break
+        
+        if family:
+            detected_families.add(family)
             filters.add(tuple(sorted((family,))))
-    filters.add(tuple(sorted(('pd-standard',))))
-    logger.info(f"Generated {len(filters)} unique SKU search filters.")
+    
+    # FIXED: Add comprehensive disk/storage filters for all common GCP disk types
+    disk_types = [
+        'pd-standard',    # Standard persistent disk
+        'pd-ssd',         # SSD persistent disk  
+        'pd-balanced',    # Balanced persistent disk
+        'pd-extreme',     # Extreme persistent disk
+        'local-ssd',      # Local SSD
+        'hyperdisk-balanced',  # Hyperdisk balanced
+        'hyperdisk-extreme',   # Hyperdisk extreme
+        'regional-pd-standard', # Regional standard
+        'regional-pd-ssd',      # Regional SSD
+    ]
+    
+    for disk_type in disk_types:
+        filters.add(tuple(sorted((disk_type,))))
+    
+    logger.info(f"Detected machine families: {sorted(detected_families)}")
+    logger.info(f"Generated {len(filters)} unique SKU search filters (including {len(disk_types)} disk types)")
     
     pricing_data = gcp_client.get_skus_from_filters([list(f) for f in filters])
     with open(LOCAL_SKU_CACHE_FILE, 'w') as f:
