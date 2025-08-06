@@ -364,7 +364,7 @@ def create_prices(morpheus_api: MorpheusApiClient):
     logger.info("--- Price creation complete. ---")
 
 def create_price_sets(morpheus_api: MorpheusApiClient):
-    """Step 4: Create comprehensive price sets from prices in Morpheus - FIXED VERSION FOR EVERYTHING PRICE SETS."""
+    """Step 4: Create comprehensive price sets from prices in Morpheus - FIXED VERSION FOR EVERYTHING PRICE SETS WITH STORAGE."""
     logger.info(f"--- Step 4: Creating Price Sets in Morpheus ---")
     if not os.path.exists(LOCAL_SKU_CACHE_FILE):
         logger.error(f"Local cache file '{LOCAL_SKU_CACHE_FILE}' not found. Please run 'sync-gcp-data' and 'create-prices' first.")
@@ -380,44 +380,78 @@ def create_price_sets(morpheus_api: MorpheusApiClient):
         return
 
     price_id_map = {p['code']: p['id'] for p in all_prices_resp['prices']}
-    price_set_groups = {}
     
-    # FIXED: Group prices by machine family and region, combining ALL price types into one comprehensive price set
+    # Separate machine family prices from storage prices
+    machine_family_prices = {}
+    storage_prices = {}
+    
+    # Storage types that should be included in every machine family price set
+    storage_types = ['pd-standard', 'pd-ssd', 'pd-balanced', 'pd-extreme', 'local-ssd', 
+                     'hyperdisk-balanced', 'hyperdisk-extreme', 'regional-pd-standard', 'regional-pd-ssd']
+    
+    # FIXED: Separate machine family pricing from storage pricing
     for price_info in pricing_data:
         family = price_info.get('machine_family', 'unknown')
         price_type = price_info.get('priceTypeCode', 'unknown')
-        
-        if family == 'software': continue  # Don't create price sets for generic software
-        
         region = price_info['region'].replace('-', '_')
-        # FIXED: Remove price type from group key to create comprehensive "Everything" price sets
-        group_key = f"gcp-{family}-{region}"
         
-        if group_key not in price_set_groups:
-            price_set_groups[group_key] = {
-                "name": f"{PRICE_PREFIX} - GCP - {family.upper()} ({price_info['region']})",
-                "code": f"{PRICE_PREFIX.lower()}.{group_key}",
-                "prices": set(),
-                "price_types": set()
-            }
+        if family == 'software': 
+            continue  # Don't create price sets for generic software
         
         price_id = price_id_map.get(price_info['morpheus_code'])
-        if price_id:
-            price_set_groups[group_key]["prices"].add(price_id)
-            price_set_groups[group_key]["price_types"].add(price_type)
+        if not price_id:
+            continue
+            
+        # Check if this is storage pricing
+        if family in storage_types or price_type == 'storage':
+            # Storage prices - collect by region to add to all machine families
+            if region not in storage_prices:
+                storage_prices[region] = set()
+            storage_prices[region].add(price_id)
+        else:
+            # Machine family prices (cores, memory)
+            group_key = f"gcp-{family}-{region}"
+            
+            if group_key not in machine_family_prices:
+                machine_family_prices[group_key] = {
+                    "name": f"{PRICE_PREFIX} - GCP - {family.upper()} ({price_info['region']})",
+                    "code": f"{PRICE_PREFIX.lower()}.{group_key}",
+                    "prices": set(),
+                    "price_types": set(),
+                    "region": price_info['region'],
+                    "region_key": region
+                }
+            
+            machine_family_prices[group_key]["prices"].add(price_id)
+            machine_family_prices[group_key]["price_types"].add(price_type)
 
-    logger.info(f"Processing {len(price_set_groups)} comprehensive price sets (Everything type)...")
-    logger.info("This creates comprehensive price sets combining all price types for each machine family")
+    # FIXED: Now add storage prices to each machine family price set
+    for group_key, data in machine_family_prices.items():
+        region_key = data["region_key"]
+        if region_key in storage_prices:
+            # Add all storage prices for this region to the machine family price set
+            data["prices"].update(storage_prices[region_key])
+            data["price_types"].add("storage")
+
+    logger.info(f"Processing {len(machine_family_prices)} comprehensive price sets (Everything type with storage)...")
+    logger.info("Each price set includes cores, memory, and storage pricing for complete VM provisioning")
     
-    for i, (key, data) in enumerate(price_set_groups.items()):
-        sys.stdout.write(f"\rProcessing price set {i + 1}/{len(price_set_groups)}: {data['name']}")
+    for i, (key, data) in enumerate(machine_family_prices.items()):
+        sys.stdout.write(f"\rProcessing price set {i + 1}/{len(machine_family_prices)}: {data['name']}")
         sys.stdout.flush()
         
         if not data["prices"]: 
             logger.warning(f"\nSkipping price set '{data['name']}' - no prices found")
             continue
         
-        logger.info(f"\nCreating price set '{data['name']}' with {len(data['prices'])} prices covering types: {sorted(data['price_types'])}")
+        logger.info(f"\nCreating comprehensive price set '{data['name']}' with {len(data['prices'])} prices")
+        logger.info(f"  Price types: {sorted(data['price_types'])}")
+        
+        # Verify we have all three required components
+        required_types = {'cores', 'memory', 'storage'}
+        if not required_types.issubset(data['price_types']):
+            missing_types = required_types - data['price_types']
+            logger.warning(f"  Warning: Missing price types {missing_types} for comprehensive pricing")
         
         # FIXED: Correct price set payload structure for "Everything" price sets
         payload = {
@@ -456,7 +490,7 @@ def create_price_sets(morpheus_api: MorpheusApiClient):
     logger.info("--- Price Set creation complete. ---")
 
 def map_plans_to_price_sets(morpheus_api: MorpheusApiClient):
-    """Step 5: Map comprehensive price sets to service plans - FIXED VERSION."""
+    """Step 5: Map comprehensive price sets to service plans - FIXED VERSION FOR COMPREHENSIVE SETS."""
     logger.info("--- Step 5: Mapping Price Sets to Service Plans ---")
     
     # Get all GCP service plans
@@ -475,7 +509,7 @@ def map_plans_to_price_sets(morpheus_api: MorpheusApiClient):
     
     price_set_map = {ps['code']: ps for ps in price_sets_resp['priceSets']}
 
-    logger.info(f"Found {len(plans)} service plans and {len(price_set_map)} price sets to process")
+    logger.info(f"Found {len(plans)} service plans and {len(price_set_map)} comprehensive price sets to process")
 
     success_count = 0
     for i, plan in enumerate(plans):
@@ -509,34 +543,25 @@ def map_plans_to_price_sets(morpheus_api: MorpheusApiClient):
             
             machine_family = match.group(1)
             
-            # FIXED: Look for comprehensive price set (no longer separated by price type)
+            # FIXED: Look for comprehensive price set (now includes cores, memory, and storage)
             expected_ps_code = f"{PRICE_PREFIX.lower()}.gcp-{machine_family}-{plan_region.replace('-', '_')}"
             
-            # Also look for storage price sets (disk types) - these might still be separate
-            storage_price_sets = []
-            for disk_type in ['pd-standard', 'pd-ssd', 'pd-balanced', 'local-ssd']:
-                disk_ps_code = f"{PRICE_PREFIX.lower()}.gcp-{disk_type}-{plan_region.replace('-', '_')}"
-                if disk_ps_code in price_set_map:
-                    storage_price_sets.append(price_set_map[disk_ps_code])
-            
-            # Find matching price sets
+            # Find matching comprehensive price set
             price_sets_to_link = []
             if expected_ps_code in price_set_map:
                 price_sets_to_link.append(price_set_map[expected_ps_code])
                 logger.debug(f"\nFound comprehensive price set for plan '{plan['name']}': {expected_ps_code}")
-            
-            # Add storage price sets
-            price_sets_to_link.extend(storage_price_sets)
-
-            if not price_sets_to_link:
-                logger.warning(f"\nNo matching price sets found for plan '{plan['name']}' (family: {machine_family}, region: {plan_region})")
+                logger.debug(f"  This price set includes cores, memory, and storage pricing")
+            else:
+                logger.warning(f"\nNo comprehensive price set found for plan '{plan['name']}' (family: {machine_family}, region: {plan_region})")
+                logger.debug(f"  Expected price set code: {expected_ps_code}")
                 continue
             
             # Get current price sets on the plan
             current_price_sets = plan.get('priceSets', []) or []
             current_ps_ids = {ps['id'] for ps in current_price_sets if ps and 'id' in ps}
             
-            # Add our price sets to the existing ones
+            # Add our comprehensive price set to the existing ones
             new_ps_ids = {ps['id'] for ps in price_sets_to_link}
             
             # Only update if there are new price sets to add
@@ -553,17 +578,17 @@ def map_plans_to_price_sets(morpheus_api: MorpheusApiClient):
                 response = morpheus_api.put(f"service-plans/{plan['id']}", payload)
                 if response and (response.get('success') or response.get('servicePlan')):
                     success_count += 1
-                    logger.debug(f"\nSuccessfully updated plan '{plan['name']}' with {len(price_sets_to_link)} price sets")
+                    logger.debug(f"\nSuccessfully updated plan '{plan['name']}' with comprehensive price set (cores+memory+storage)")
                 else:
                     logger.error(f"\nFailed to update plan '{plan['name']}'. Response: {response}")
             else:
-                logger.debug(f"\nPlan '{plan['name']}' already has all required price sets")
+                logger.debug(f"\nPlan '{plan['name']}' already has the required comprehensive price set")
                 
         except Exception as e:
             logger.error(f"\nException processing plan '{plan['name']}': {e}")
 
     sys.stdout.write("\n")
-    logger.info(f"--- Service Plan mapping complete. Updated {success_count} plans. ---")
+    logger.info(f"--- Service Plan mapping complete. Updated {success_count} plans with comprehensive pricing. ---")
 
 def validate(morpheus_api: MorpheusApiClient):
     """Utility: Validate pricing on service plans."""
