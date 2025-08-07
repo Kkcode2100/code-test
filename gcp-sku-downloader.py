@@ -35,6 +35,9 @@ from urllib3.util.retry import Retry
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Global logger variable
+logger = None
+
 class GCPBillingCatalogClient:
     """Client for fetching complete SKU data from GCP Billing Catalog API."""
     
@@ -61,17 +64,20 @@ class GCPBillingCatalogClient:
             'Content-Type': 'application/json'
         })
         
-        logger.info(f"Initialized GCP Billing Catalog client for region: {self.region}")
+        if logger:
+            logger.info(f"Initialized GCP Billing Catalog client for region: {self.region}")
 
     def _get_access_token(self):
         """Get access token from gcloud CLI."""
         try:
-            logger.info("Fetching GCP access token from gcloud CLI...")
+            if logger:
+                logger.info("Fetching GCP access token from gcloud CLI...")
             env = os.environ.copy()
             
             # Handle service account credentials if present
             if "GOOGLE_APPLICATION_CREDENTIALS" in env and os.path.exists(env["GOOGLE_APPLICATION_CREDENTIALS"]):
-                logger.info(f"Using service account from GOOGLE_APPLICATION_CREDENTIALS")
+                if logger:
+                    logger.info(f"Using service account from GOOGLE_APPLICATION_CREDENTIALS")
                 env["CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"] = env["GOOGLE_APPLICATION_CREDENTIALS"]
             
             result = subprocess.run(
@@ -86,15 +92,18 @@ class GCPBillingCatalogClient:
             if not token:
                 raise ValueError("Empty access token received from gcloud")
             
-            logger.info("Successfully obtained GCP access token")
+            if logger:
+                logger.info("Successfully obtained GCP access token")
             return token
             
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to get access token from gcloud: {e}")
-            logger.error(f"stderr: {e.stderr}")
+            if logger:
+                logger.error(f"Failed to get access token from gcloud: {e}")
+                logger.error(f"stderr: {e.stderr}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error getting access token: {e}")
+            if logger:
+                logger.error(f"Unexpected error getting access token: {e}")
             raise
 
     def _make_request(self, endpoint, params=None):
@@ -105,12 +114,14 @@ class GCPBillingCatalogClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed for {endpoint}: {e}")
+            if logger:
+                logger.error(f"API request failed for {endpoint}: {e}")
             raise
 
     def get_all_services(self):
         """Get all available billing services."""
-        logger.info("Fetching all available billing services...")
+        if logger:
+            logger.info("Fetching all available billing services...")
         services = []
         page_token = None
         
@@ -127,19 +138,23 @@ class GCPBillingCatalogClient:
                 if not page_token:
                     break
                     
-                logger.info(f"Fetched {len(services)} services so far...")
+                if logger:
+                    logger.info(f"Fetched {len(services)} services so far...")
                 time.sleep(0.1)  # Rate limiting
                 
             except Exception as e:
-                logger.error(f"Error fetching services: {e}")
+                if logger:
+                    logger.error(f"Error fetching services: {e}")
                 break
         
-        logger.info(f"Total services found: {len(services)}")
+        if logger:
+            logger.info(f"Total services found: {len(services)}")
         return services
 
     def get_service_skus(self, service_id):
         """Get all SKUs for a specific service."""
-        logger.info(f"Fetching SKUs for service: {service_id}")
+        if logger:
+            logger.info(f"Fetching SKUs for service: {service_id}")
         skus = []
         page_token = None
         
@@ -160,19 +175,23 @@ class GCPBillingCatalogClient:
                 if not page_token:
                     break
                     
-                logger.info(f"Fetched {len(skus)} SKUs for {service_id} so far...")
+                if logger:
+                    logger.info(f"Fetched {len(skus)} SKUs for {service_id} so far...")
                 time.sleep(0.1)  # Rate limiting
                 
             except Exception as e:
-                logger.error(f"Error fetching SKUs for {service_id}: {e}")
+                if logger:
+                    logger.error(f"Error fetching SKUs for {service_id}: {e}")
                 break
         
-        logger.info(f"Total SKUs for {service_id}: {len(skus)}")
+        if logger:
+            logger.info(f"Total SKUs for {service_id}: {len(skus)}")
         return skus
 
     def download_complete_catalog(self):
         """Download the complete SKU catalog for the region."""
-        logger.info(f"Starting complete SKU catalog download for region: {self.region}")
+        if logger:
+            logger.info(f"Starting complete SKU catalog download for region: {self.region}")
         
         # Get all services
         services = self.get_all_services()
@@ -195,7 +214,8 @@ class GCPBillingCatalogClient:
             service_id = service['serviceId']
             service_name = service.get('displayName', service_id)
             
-            logger.info(f"Processing service {i}/{len(services)}: {service_name} ({service_id})")
+            if logger:
+                logger.info(f"Processing service {i}/{len(services)}: {service_name} ({service_id})")
             
             try:
                 skus = self.get_service_skus(service_id)
@@ -223,12 +243,15 @@ class GCPBillingCatalogClient:
                     catalog['services'][service_id] = service_data
                     catalog['metadata']['total_skus'] += len(skus)
                     
-                    logger.info(f"  Added {len(skus)} SKUs for {service_name}")
+                    if logger:
+                        logger.info(f"  Added {len(skus)} SKUs for {service_name}")
                 else:
-                    logger.info(f"  No SKUs found for {service_name}")
+                    if logger:
+                        logger.info(f"  No SKUs found for {service_name}")
                 
             except Exception as e:
-                logger.error(f"Error processing service {service_id}: {e}")
+                if logger:
+                    logger.error(f"Error processing service {service_id}: {e}")
                 continue
             
             # Rate limiting between services
@@ -243,11 +266,13 @@ class GCPBillingCatalogClient:
                 catalog['services'][service_id]['categories']
             )
         
-        logger.info(f"Download complete! Total SKUs: {catalog['metadata']['total_skus']}")
+        if logger:
+            logger.info(f"Download complete! Total SKUs: {catalog['metadata']['total_skus']}")
         return catalog
 
 def setup_logging(verbose=False):
     """Setup logging configuration."""
+    global logger
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -257,13 +282,15 @@ def setup_logging(verbose=False):
             logging.FileHandler('gcp-sku-download.log')
         ]
     )
+    logger = logging.getLogger(__name__)
 
 def save_catalog(catalog, output_file):
     """Save catalog to JSON file."""
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(catalog, f, indent=2, ensure_ascii=False)
-        logger.info(f"Catalog saved to: {output_file}")
+        if logger:
+            logger.info(f"Catalog saved to: {output_file}")
         
         # Also save a summary
         summary_file = output_file.replace('.json', '_summary.json')
@@ -282,10 +309,12 @@ def save_catalog(catalog, output_file):
         
         with open(summary_file, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
-        logger.info(f"Summary saved to: {summary_file}")
+        if logger:
+            logger.info(f"Summary saved to: {summary_file}")
         
     except Exception as e:
-        logger.error(f"Error saving catalog: {e}")
+        if logger:
+            logger.error(f"Error saving catalog: {e}")
         raise
 
 def print_summary(catalog):
@@ -369,13 +398,16 @@ Examples:
         # Print summary
         print_summary(catalog)
         
-        logger.info("SKU catalog download completed successfully!")
+        if logger:
+            logger.info("SKU catalog download completed successfully!")
         
     except KeyboardInterrupt:
-        logger.info("Download interrupted by user")
+        if logger:
+            logger.info("Download interrupted by user")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"Download failed: {e}")
+        if logger:
+            logger.error(f"Download failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
