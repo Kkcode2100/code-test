@@ -11,10 +11,12 @@ Features:
 - Better error handling and retry logic
 - Improved logging and debugging
 - Comprehensive validation and reporting
+- Aligned with successful gcp-sku-downloader.py output format
 
 Usage:
-    python gcp-price-sync-enhanced-v2.py --sku-catalog skus_asia.json
-    python gcp-price-sync-enhanced-v2.py --sku-catalog skus_asia.json --dry-run
+    python gcp-price-sync-enhanced-v2.py --sku-catalog gcp_skus_20250807_194211.json
+    python gcp-price-sync-enhanced-v2.py --sku-catalog gcp_skus_20250807_194211.json --dry-run
+    python gcp-price-sync-enhanced-v2.py --sku-catalog gcp_skus_20250807_194211.json --validate-only
 """
 
 import requests
@@ -96,7 +98,7 @@ class MorpheusApiClient:
         return self._request('put', endpoint, payload=payload)
 
 class SKUCatalogProcessor:
-    """Process and analyze the comprehensive SKU catalog."""
+    """Process and analyze the comprehensive SKU catalog from gcp-sku-downloader.py."""
     
     def __init__(self, catalog_file):
         self.catalog_file = catalog_file
@@ -108,7 +110,18 @@ class SKUCatalogProcessor:
         try:
             with open(self.catalog_file, 'r', encoding='utf-8') as f:
                 catalog = json.load(f)
-            logger.info(f"Loaded SKU catalog: {catalog['metadata']['total_services']} services, {catalog['metadata']['total_skus']} SKUs")
+            
+            # Validate catalog structure
+            if 'metadata' not in catalog or 'services' not in catalog:
+                raise ValueError("Invalid catalog format: missing metadata or services")
+            
+            metadata = catalog['metadata']
+            logger.info(f"Loaded SKU catalog:")
+            logger.info(f"  Region: {metadata.get('region', 'unknown')}")
+            logger.info(f"  Download timestamp: {metadata.get('download_timestamp', 'unknown')}")
+            logger.info(f"  Total services: {metadata.get('total_services', 0)}")
+            logger.info(f"  Total SKUs: {metadata.get('total_skus', 0)}")
+            
             return catalog
         except Exception as e:
             logger.error(f"Error loading SKU catalog: {e}")
@@ -121,21 +134,32 @@ class SKUCatalogProcessor:
             'storage': [],
             'network': [],
             'database': [],
+            'application_services': [],
             'other': []
         }
         
+        total_processed = 0
+        total_skipped = 0
+        
         for service_id, service_data in self.catalog['services'].items():
             service_name = service_data['service_info']['display_name']
+            logger.debug(f"Processing service: {service_name} ({service_id})")
             
             for sku in service_data['skus']:
                 normalized_sku = self._normalize_sku(sku, service_name, service_id)
                 if normalized_sku:
                     category = self._categorize_sku(normalized_sku)
                     processed[category].append(normalized_sku)
+                    total_processed += 1
+                else:
+                    total_skipped += 1
         
         # Log summary
+        logger.info(f"SKU Processing Summary:")
+        logger.info(f"  Total processed: {total_processed}")
+        logger.info(f"  Total skipped: {total_skipped}")
         for category, skus in processed.items():
-            logger.info(f"Processed {len(skus)} {category} SKUs")
+            logger.info(f"  {category}: {len(skus)} SKUs")
         
         return processed
     
@@ -191,28 +215,34 @@ class SKUCatalogProcessor:
         description = sku['description'].lower()
         
         # Storage services
-        if any(keyword in service_name for keyword in ['storage', 'cloud storage', 'filestore']):
+        if any(keyword in service_name for keyword in ['storage', 'cloud storage', 'filestore', 'netapp']):
             return 'storage'
         
         # Compute services
-        if any(keyword in service_name for keyword in ['compute', 'vm', 'instance', 'gke']):
+        if any(keyword in service_name for keyword in ['compute', 'vm', 'instance', 'gke', 'kubernetes']):
             return 'compute'
         
         # Network services
-        if any(keyword in service_name for keyword in ['network', 'vpc', 'load balancer', 'cdn']):
+        if any(keyword in service_name for keyword in ['network', 'vpc', 'load balancer', 'cdn', 'networking']):
             return 'network'
         
         # Database services
-        if any(keyword in service_name for keyword in ['sql', 'database', 'firestore', 'bigtable']):
+        if any(keyword in service_name for keyword in ['sql', 'database', 'firestore', 'bigtable', 'spanner', 'alloydb']):
             return 'database'
         
+        # Application services
+        if any(keyword in service_name for keyword in ['run', 'functions', 'app engine', 'composer', 'dataflow', 'vertex ai', 'bigquery']):
+            return 'application_services'
+        
         # Check description for additional clues
-        if any(keyword in description for keyword in ['storage', 'gb', 'tb']):
+        if any(keyword in description for keyword in ['storage', 'gb', 'tb', 'byte']):
             return 'storage'
-        if any(keyword in description for keyword in ['cpu', 'ram', 'memory', 'core']):
+        if any(keyword in description for keyword in ['cpu', 'ram', 'memory', 'core', 'instance']):
             return 'compute'
-        if any(keyword in description for keyword in ['network', 'bandwidth', 'transfer']):
+        if any(keyword in description for keyword in ['network', 'bandwidth', 'transfer', 'egress']):
             return 'network'
+        if any(keyword in description for keyword in ['database', 'sql', 'query', 'table']):
+            return 'database'
         
         return 'other'
     
@@ -240,6 +270,16 @@ class SKUCatalogProcessor:
                 'services': list(set(sku['service_name'] for sku in skus))
             }
         return summary
+    
+    def get_service_summary(self):
+        """Get service-level summary matching the downloader output format."""
+        service_summary = {}
+        for service_id, service_data in self.catalog['services'].items():
+            service_summary[service_id] = {
+                'display_name': service_data['service_info']['display_name'],
+                'sku_count': len(service_data['skus'])
+            }
+        return service_summary
 
 def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
     """Discover existing plans in Morpheus."""
@@ -461,6 +501,43 @@ def validate_comprehensive_sync(morpheus_api: MorpheusApiClient, sku_processor: 
         logger.error(f"Error during validation: {e}")
         return None
 
+def print_detailed_summary(sku_processor: SKUCatalogProcessor, validation_results=None):
+    """Print detailed summary matching the downloader format."""
+    print("\n" + "="*80)
+    print("GCP PRICE SYNC ENHANCED V2 - DETAILED SUMMARY")
+    print("="*80)
+    
+    # Print metadata
+    metadata = sku_processor.catalog['metadata']
+    print(f"Region: {metadata.get('region', 'unknown')}")
+    print(f"Sync timestamp: {datetime.now().isoformat()}")
+    print(f"Total services: {metadata.get('total_services', 0)}")
+    print(f"Total SKUs: {metadata.get('total_skus', 0)}")
+    
+    # Print SKU summary
+    sku_summary = sku_processor.get_sku_summary()
+    print(f"\nSKU Summary:")
+    for category, summary in sku_summary.items():
+        if summary['count'] > 0:
+            print(f"  {category}: {summary['count']}")
+    
+    # Print service summary (top 10 by SKU count)
+    service_summary = sku_processor.get_service_summary()
+    sorted_services = sorted(service_summary.items(), key=lambda x: x[1]['sku_count'], reverse=True)
+    
+    print(f"\nTop Services by SKU Count:")
+    for service_id, service_info in sorted_services[:10]:
+        print(f"  {service_id}: {service_info['display_name']} ({service_info['sku_count']} SKUs)")
+    
+    # Print validation results if available
+    if validation_results:
+        print(f"\nValidation Results:")
+        print(f"  GCP Prices in Morpheus: {validation_results['gcp_prices']}")
+        print(f"  GCP Price Sets in Morpheus: {validation_results['gcp_price_sets']}")
+        print(f"  Coverage: {validation_results['coverage_percentage']:.1f}%")
+    
+    print("="*80)
+
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(
@@ -468,9 +545,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python gcp-price-sync-enhanced-v2.py --sku-catalog skus_asia.json
-  python gcp-price-sync-enhanced-v2.py --sku-catalog skus_asia.json --dry-run
-  python gcp-price-sync-enhanced-v2.py --sku-catalog skus_asia.json --validate-only
+  python gcp-price-sync-enhanced-v2.py --sku-catalog gcp_skus_20250807_194211.json
+  python gcp-price-sync-enhanced-v2.py --sku-catalog gcp_skus_20250807_194211.json --dry-run
+  python gcp-price-sync-enhanced-v2.py --sku-catalog gcp_skus_20250807_194211.json --validate-only
         """
     )
     
@@ -512,12 +589,7 @@ Examples:
         if args.validate_only:
             # Only validate
             validation_results = validate_comprehensive_sync(morpheus_api, sku_processor)
-            if validation_results:
-                print("\nValidation Summary:")
-                print(f"GCP Prices: {validation_results['gcp_prices']}")
-                print(f"GCP Price Sets: {validation_results['gcp_price_sets']}")
-                print(f"Catalog SKUs: {validation_results['catalog_skus']}")
-                print(f"Coverage: {validation_results['coverage_percentage']:.1f}%")
+            print_detailed_summary(sku_processor, validation_results)
         else:
             # Full sync
             sync_results = sync_comprehensive_data(morpheus_api, sku_processor, args.dry_run)
@@ -525,14 +597,8 @@ Examples:
             # Validate results
             validation_results = validate_comprehensive_sync(morpheus_api, sku_processor)
             
-            # Print summary
-            print("\nSync Summary:")
-            print(f"SKU Categories: {list(sync_results['sku_summary'].keys())}")
-            for category, summary in sync_results['sku_summary'].items():
-                print(f"  {category}: {summary['count']} SKUs")
-            
-            if validation_results:
-                print(f"\nCoverage: {validation_results['coverage_percentage']:.1f}%")
+            # Print detailed summary
+            print_detailed_summary(sku_processor, validation_results)
         
         logger.info("Enhanced price sync completed successfully!")
         
