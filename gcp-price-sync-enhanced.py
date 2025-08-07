@@ -113,43 +113,22 @@ class GCPPricingClient:
         return response.json()
 
     def _get_all_services(self):
-        services_url = f"{self.API_HOST}/v1/services"
-        return self._make_api_request(services_url).get('services', [])
+        all_services = []
+        next_page_token = None
+        while True:
+            params = {'pageToken': next_page_token} if next_page_token else {}
+            data = self._make_api_request(f"{self.API_HOST}/v1/services", params)
+            all_services.extend(data.get('services', []))
+            next_page_token = data.get('nextPageToken')
+            if not next_page_token: break
+        return all_services
 
     def get_skus_from_filters(self, filters):
         normalized_skus = []
-        
-        # DEBUG: Log all available services to help identify Compute Engine
-        logger.info(f"Available services count: {len(self.all_services)}")
-        logger.info("First 10 services for reference:")
-        for i, service in enumerate(self.all_services[:10]):
-            logger.info(f"  {i+1}. {service.get('displayName', 'N/A')} (ID: {service.get('serviceId', 'N/A')})")
-        
-        # Look for Compute Engine service with multiple possible IDs
-        compute_service = None
-        possible_compute_ids = ['6F81-5844-456A', '6F81-5844-456A', '6F81-5844-456A']
-        
-        # First try the hardcoded ID
         compute_service = next((s for s in self.all_services if s['serviceId'] == '6F81-5844-456A'), None)
-        
-        # If not found, try to find by display name
-        if not compute_service:
-            logger.info("Hardcoded Compute Engine service ID not found, searching by display name...")
-            for service in self.all_services:
-                display_name = service.get('displayName', '').lower()
-                if 'compute engine' in display_name or 'compute' in display_name:
-                    logger.info(f"Found potential Compute Engine service: {service.get('displayName')} (ID: {service.get('serviceId')})")
-                    compute_service = service
-                    break
-        
         if not compute_service:
             logger.error("Compute Engine service not found.")
-            logger.error("Available services:")
-            for service in self.all_services:
-                logger.error(f"  - {service.get('displayName', 'N/A')} (ID: {service.get('serviceId', 'N/A')})")
             return []
-
-        logger.info(f"Using Compute Engine service: {compute_service.get('displayName')} (ID: {compute_service.get('serviceId')})")
         logger.info(f"Querying SKUs for {len(filters)} filter sets...")
         for i, f in enumerate(filters):
             progress_message = f"Processing filter {i + 1}/{len(filters)}: {' & '.join(f):<50}"
