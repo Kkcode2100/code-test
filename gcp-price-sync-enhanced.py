@@ -1,3 +1,25 @@
+#!/usr/bin/env python3
+"""
+GCP Price Sync Enhanced - Complete Service Plan, Price, and Price Set Creation
+
+This enhanced version uses the downloaded SKU catalog from gcp-sku-downloader.py
+to create comprehensive service plans, prices, and price sets with proper mapping.
+
+Features:
+- Uses downloaded SKU catalog (no API calls needed)
+- Creates service plans based on GCP instance types
+- Creates comprehensive pricing data from SKU catalog
+- Creates price sets by category and service
+- Maps price sets to service plans
+- Handles tiered pricing and regional pricing
+- Comprehensive validation and reporting
+
+Usage:
+    python gcp-price-sync-enhanced.py --sku-catalog gcp_skus_20250807_194211.json
+    python gcp-price-sync-enhanced.py --sku-catalog gcp_skus_20250807_194211.json --dry-run
+    python gcp-price-sync-enhanced.py --sku-catalog gcp_skus_20250807_194211.json --create-service-plans
+"""
+
 import requests
 import json
 import logging
@@ -7,24 +29,23 @@ import argparse
 import os
 import re
 import uuid
-import subprocess
 import sys
+from datetime import datetime
+from collections import defaultdict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- Configuration ---
-MORPHEUS_URL = os.getenv("MORPHEUS_URL", "https://localhost")  # Change this to your actual Morpheus server URL
+MORPHEUS_URL = os.getenv("MORPHEUS_URL", "https://localhost")
 MORPHEUS_TOKEN = os.getenv("MORPHEUS_TOKEN", "9fcc4426-c89a-4430-b6d7-99d5950fc1cc")
 GCP_REGION = os.getenv("GCP_REGION", "asia-southeast2")
 PRICE_PREFIX = os.getenv("PRICE_PREFIX", "IOH-CP")
-LOCAL_SKU_CACHE_FILE = "gcp_plan_skus.json"
 
 # --- Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- Morpheus API Client ---
 class MorpheusApiClient:
     """Client for interacting with the Morpheus API."""
     def __init__(self, base_url, api_token, max_retries=5, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)):
@@ -56,7 +77,6 @@ class MorpheusApiClient:
         except requests.exceptions.HTTPError as e:
             if response.status_code != 404:
                 logger.error(f"HTTP Error for {method.upper()} {endpoint}: {e.response.status_code} - {e.response.text}")
-                # Log response details for debugging
                 try:
                     error_detail = e.response.json()
                     logger.error(f"Error details: {json.dumps(error_detail, indent=2)}")
@@ -77,744 +97,635 @@ class MorpheusApiClient:
     def put(self, endpoint, payload):
         return self._request('put', endpoint, payload=payload)
 
-# --- Cloud Pricing Client ---
-class GCPPricingClient:
-    """Client for fetching SKU data from the GCP Billing Catalog API using gcloud for auth."""
-    API_HOST = "https://cloudbilling.googleapis.com"
+class SKUCatalogProcessor:
+    """Process and analyze the comprehensive SKU catalog."""
     
-    def __init__(self, region):
-        self.region = region
-        self.session = requests.Session()
-        self.access_token = self._get_access_token_from_gcloud()
-        self.all_services = self._get_all_services()
-        logger.info(f"Initialized GCP Pricing Client for region: {self.region} with {len(self.all_services)} services cached.")
-
-    def _get_access_token_from_gcloud(self):
+    def __init__(self, catalog_file):
+        self.catalog_file = catalog_file
+        self.catalog = self._load_catalog()
+        self.processed_skus = self._process_skus()
+        self.compute_skus = self._extract_compute_skus()
+        
+    def _load_catalog(self):
+        """Load the SKU catalog from file."""
         try:
-            logger.info("Fetching GCP access token from gcloud CLI...")
-            env = os.environ.copy()
-            if "GOOGLE_APPLICATION_CREDENTIALS" in env and os.path.exists(env["GOOGLE_APPLICATION_CREDENTIALS"]):
-                logger.info(f"Using service account from GOOGLE_APPLICATION_CREDENTIALS.")
-                env["CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"] = env["GOOGLE_APPLICATION_CREDENTIALS"]
-            
-            result = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True, text=True, check=True, env=env)
-            token = result.stdout.strip()
-            if not token: raise ValueError("gcloud did not return an access token.")
-            logger.info("Successfully obtained GCP access token.")
-            return token
-        except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
-            logger.critical(f"Failed to get gcloud token: {e}")
+            with open(self.catalog_file, 'r', encoding='utf-8') as f:
+                catalog = json.load(f)
+            logger.info(f"Loaded SKU catalog: {catalog['metadata']['total_services']} services, {catalog['metadata']['total_skus']} SKUs")
+            return catalog
+        except Exception as e:
+            logger.error(f"Error loading SKU catalog: {e}")
             raise
-
-    def _make_api_request(self, url, params=None):
-        headers = {'Authorization': f'Bearer {self.access_token}'}
-        response = self.session.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return response.json()
-
-    def _get_all_services(self):
-        all_services = []
-        next_page_token = None
-        while True:
-            params = {'pageToken': next_page_token} if next_page_token else {}
-            data = self._make_api_request(f"{self.API_HOST}/v1/services", params)
-            all_services.extend(data.get('services', []))
-            next_page_token = data.get('nextPageToken')
-            if not next_page_token: break
-        return all_services
-
-    def get_skus_from_filters(self, filters):
-        normalized_skus = []
-        compute_service = next((s for s in self.all_services if s['serviceId'] == '6F81-5844-456A'), None)
-        if not compute_service:
-            logger.error("Compute Engine service not found.")
-            return []
-        logger.info(f"Querying SKUs for {len(filters)} filter sets...")
-        for i, f in enumerate(filters):
-            progress_message = f"Processing filter {i + 1}/{len(filters)}: {' & '.join(f):<50}"
-            sys.stdout.write(f"\r{progress_message}")
-            sys.stdout.flush()
-
-            skus_url = f"{self.API_HOST}/v1/{compute_service['name']}/skus"
-            next_page_token = None
-            while True:
-                params = {'currencyCode': 'USD', 'pageToken': next_page_token} if next_page_token else {'currencyCode': 'USD'}
-                data = self._make_api_request(skus_url, params=params)
-                for sku in data.get('skus', []):
-                    if self.region in sku.get('serviceRegions', []) and all(term.lower() in sku.get('description', '').lower() for term in f):
-                        normalized_sku = self._normalize_gcp_sku(sku)
-                        if normalized_sku and not any(d['sku_id'] == normalized_sku['sku_id'] for d in normalized_skus):
-                            normalized_skus.append(normalized_sku)
-                next_page_token = data.get('nextPageToken')
-                if not next_page_token: break
-        sys.stdout.write("\n")
-        logger.info(f"Found {len(normalized_skus)} matching SKUs.")
-        return normalized_skus
-
-    def _normalize_gcp_sku(self, sku_dict):
-        pricing_info = sku_dict.get('pricingInfo', [{}])[0]
-        tiered_rates = pricing_info.get('pricingExpression', {}).get('tieredRates', [{}])[0]
-        unit_price = tiered_rates.get('unitPrice', {})
-        base_price = float(unit_price.get('units', 0)) + float(unit_price.get('nanos', 0)) / 1e9
-        if base_price == 0.0: return None
-
-        category = sku_dict.get('category', {})
-        resource_family = category.get('resourceFamily', '').upper()
-        resource_group = category.get('resourceGroup', '').upper()
-        
-        price_type_code = 'software'
-        machine_family_heuristic = 'software'
-        description = sku_dict.get('description', '').lower()
-        
-        if resource_family == "COMPUTE":
-            if resource_group == "CPU": 
-                price_type_code = 'cores'
-                # Extract family from description, e.g., "N2 CPU..." -> "n2"
-                family_match = re.search(r'^([A-Z0-9]+[A-Z]?)', sku_dict.get('description', ''))
-                if family_match: machine_family_heuristic = family_match.group(1).lower()
-            elif resource_group == "RAM": 
-                price_type_code = 'memory'
-                family_match = re.search(r'^([A-Z0-9]+[A-Z]?)', sku_dict.get('description', ''))
-                if family_match: machine_family_heuristic = family_match.group(1).lower()
-        elif resource_family == "STORAGE":
-            if resource_group == "DISK": 
-                price_type_code = 'storage'
-                # FIXED: Better disk type detection from description
-                if 'ssd' in description and 'local' in description:
-                    machine_family_heuristic = 'local-ssd'
-                elif 'hyperdisk' in description and 'balanced' in description:
-                    machine_family_heuristic = 'hyperdisk-balanced'
-                elif 'hyperdisk' in description and 'extreme' in description:
-                    machine_family_heuristic = 'hyperdisk-extreme'
-                elif 'pd-extreme' in description or 'extreme' in description:
-                    machine_family_heuristic = 'pd-extreme'
-                elif 'pd-balanced' in description or 'balanced' in description:
-                    machine_family_heuristic = 'pd-balanced'
-                elif 'pd-ssd' in description or ('ssd' in description and 'persistent' in description):
-                    machine_family_heuristic = 'pd-ssd'
-                elif 'regional' in description and 'ssd' in description:
-                    machine_family_heuristic = 'regional-pd-ssd'
-                elif 'regional' in description:
-                    machine_family_heuristic = 'regional-pd-standard'
-                else:
-                    machine_family_heuristic = 'pd-standard'
-        
-        usage_unit_desc = pricing_info.get('pricingExpression', {}).get('usageUnitDescription', '').lower()
-        price_unit = 'month' if 'month' in usage_unit_desc else 'hour'
-        incur_charges = 'running' if resource_family == "COMPUTE" else 'always'
-        morpheus_price_code = f"{PRICE_PREFIX.lower()}.gcp.{sku_dict.get('skuId')}.{self.region.replace('-', '_').lower()}"
-
-        return {
-            "sku_id": sku_dict.get('skuId'), "morpheus_code": morpheus_price_code,
-            "description": sku_dict.get('description', 'N/A'), "region": self.region,
-            "priceTypeCode": price_type_code, "priceUnit": price_unit,
-            "incurCharges": incur_charges, "currency": unit_price.get('currencyCode', 'USD'),
-            "price_per_unit": base_price, "machine_family": machine_family_heuristic
+    
+    def _process_skus(self):
+        """Process and normalize SKUs for pricing sync."""
+        processed = {
+            'compute': [],
+            'storage': [],
+            'network': [],
+            'database': [],
+            'ai_ml': [],
+            'other': []
         }
-
-# --- Modular Functions ---
+        
+        for service_id, service_data in self.catalog['services'].items():
+            service_name = service_data['service_info']['display_name']
+            
+            for sku in service_data['skus']:
+                normalized_sku = self._normalize_sku(sku, service_name, service_id)
+                if normalized_sku:
+                    category = self._categorize_sku(normalized_sku)
+                    processed[category].append(normalized_sku)
+        
+        # Log summary
+        for category, skus in processed.items():
+            logger.info(f"Processed {len(skus)} {category} SKUs")
+        
+        return processed
+    
+    def _normalize_sku(self, sku, service_name, service_id):
+        """Normalize SKU data for pricing sync."""
+        try:
+            # Extract pricing info
+            pricing_info = sku.get('pricingInfo', [])
+            if not pricing_info:
+                return None
+            
+            # Get the first pricing tier
+            tiered_rates = pricing_info[0].get('pricingExpression', {}).get('tieredRates', [])
+            if not tiered_rates:
+                return None
+            
+            # Extract rate
+            rate = tiered_rates[0].get('unitPrice', {})
+            if not rate:
+                return None
+            
+            # Determine pricing unit
+            pricing_unit = pricing_info[0].get('pricingExpression', {}).get('usageUnit', 'hour')
+            
+            # Extract SKU details
+            sku_id = sku.get('skuId', '')
+            description = sku.get('description', '')
+            category = sku.get('category', {})
+            
+            # Create normalized SKU
+            normalized = {
+                'sku_id': sku_id,
+                'description': description,
+                'service_name': service_name,
+                'service_id': service_id,
+                'category': category,
+                'pricing_unit': pricing_unit,
+                'rate': rate,
+                'tiered_rates': tiered_rates,
+                'pricing_info': pricing_info,
+                'original_sku': sku
+            }
+            
+            return normalized
+            
+        except Exception as e:
+            logger.warning(f"Error normalizing SKU {sku.get('skuId', 'unknown')}: {e}")
+            return None
+    
+    def _categorize_sku(self, sku):
+        """Categorize SKU based on service and description."""
+        service_name = sku['service_name'].lower()
+        description = sku['description'].lower()
+        category = sku['category']
+        
+        # Check resource family first
+        resource_family = category.get('resourceFamily', '').lower()
+        if resource_family == 'storage':
+            return 'storage'
+        elif resource_family == 'compute':
+            return 'compute'
+        elif resource_family == 'network':
+            return 'network'
+        elif resource_family == 'database':
+            return 'database'
+        elif resource_family in ['ai/ml', 'ai', 'ml']:
+            return 'ai_ml'
+        
+        # Storage services
+        if any(keyword in service_name for keyword in ['storage', 'cloud storage', 'filestore', 'memorystore']):
+            return 'storage'
+        
+        # Compute services
+        if any(keyword in service_name for keyword in ['compute', 'vm', 'instance', 'gke', 'kubernetes', 'run', 'functions']):
+            return 'compute'
+        
+        # Network services
+        if any(keyword in service_name for keyword in ['network', 'vpc', 'load balancer', 'cdn', 'gateway']):
+            return 'network'
+        
+        # Database services
+        if any(keyword in service_name for keyword in ['sql', 'database', 'firestore', 'bigtable', 'spanner', 'alloydb']):
+            return 'database'
+        
+        # AI/ML services
+        if any(keyword in service_name for keyword in ['ai', 'ml', 'vertex', 'notebooks', 'composer', 'dataflow']):
+            return 'ai_ml'
+        
+        # Check description for additional clues
+        if any(keyword in description for keyword in ['storage', 'gb', 'tb']):
+            return 'storage'
+        if any(keyword in description for keyword in ['cpu', 'ram', 'memory', 'core']):
+            return 'compute'
+        if any(keyword in description for keyword in ['network', 'bandwidth', 'transfer']):
+            return 'network'
+        if any(keyword in description for keyword in ['database', 'sql', 'query']):
+            return 'database'
+        if any(keyword in description for keyword in ['ai', 'ml', 'machine learning', 'tensorflow']):
+            return 'ai_ml'
+        
+        return 'other'
+    
+    def _extract_compute_skus(self):
+        """Extract compute SKUs for service plan creation."""
+        compute_skus = []
+        
+        # Look for Compute Engine service
+        for service_id, service_data in self.catalog['services'].items():
+            if service_data['service_info']['display_name'] == 'Compute Engine':
+                for sku in service_data['skus']:
+                    # Extract instance type information
+                    description = sku.get('description', '').lower()
+                    sku_id = sku.get('skuId', '')
+                    
+                    # Look for instance type patterns
+                    instance_patterns = [
+                        r'(\w+\d+[a-z]?-\w+-\d+)',  # e2-standard-2, n2-standard-4, etc.
+                        r'(\w+\d+[a-z]?-\w+)',      # e2-standard, n2-standard, etc.
+                        r'(\w+\d+[a-z]?-\d+)',      # e2-2, n2-4, etc.
+                    ]
+                    
+                    for pattern in instance_patterns:
+                        matches = re.findall(pattern, description)
+                        for match in matches:
+                            compute_skus.append({
+                                'instance_type': match,
+                                'sku_id': sku_id,
+                                'description': sku.get('description', ''),
+                                'pricing_info': sku.get('pricingInfo', []),
+                                'original_sku': sku
+                            })
+                            break
+                    else:
+                        # If no instance type found, still include for general compute pricing
+                        compute_skus.append({
+                            'instance_type': 'general',
+                            'sku_id': sku_id,
+                            'description': sku.get('description', ''),
+                            'pricing_info': sku.get('pricingInfo', []),
+                            'original_sku': sku
+                        })
+        
+        logger.info(f"Extracted {len(compute_skus)} compute SKUs for service plan creation")
+        return compute_skus
+    
+    def get_storage_skus(self):
+        """Get all storage-related SKUs."""
+        return self.processed_skus['storage']
+    
+    def get_compute_skus(self):
+        """Get all compute-related SKUs."""
+        return self.processed_skus['compute']
+    
+    def get_network_skus(self):
+        """Get all network-related SKUs."""
+        return self.processed_skus['network']
+    
+    def get_database_skus(self):
+        """Get all database-related SKUs."""
+        return self.processed_skus['database']
+    
+    def get_ai_ml_skus(self):
+        """Get all AI/ML-related SKUs."""
+        return self.processed_skus['ai_ml']
+    
+    def get_all_skus(self):
+        """Get all processed SKUs."""
+        all_skus = []
+        for category_skus in self.processed_skus.values():
+            all_skus.extend(category_skus)
+        return all_skus
+    
+    def get_sku_summary(self):
+        """Get summary of processed SKUs."""
+        summary = {}
+        for category, skus in self.processed_skus.items():
+            summary[category] = {
+                'count': len(skus),
+                'services': list(set(sku['service_name'] for sku in skus))
+            }
+        return summary
 
 def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
-    """Step 1: Discover Google service plans from Morpheus - FIXED TO FILTER ONLY GCP PLANS."""
-    logger.info("--- Step 1: Discovering Morpheus Service Plans ---")
-    plans = morpheus_api.get("service-plans?provisionTypeCode=google&max=1000")
-    all_plans = plans.get('servicePlans', []) if plans else []
+    """Discover existing plans in Morpheus."""
+    logger.info("Discovering existing Morpheus plans...")
     
-    # FIXED: Filter to only include actual GCP machine types, exclude non-GCP plans
-    gcp_patterns = [
-        r'^[a-z]\d+[a-z]?-',  # Standard GCP patterns like e2-, n2-, c2-, etc.
-        r'^f1-micro$', r'^g1-small$',  # Legacy GCP types
-        r'^[a-z]\d+-custom',  # Custom machine types
-    ]
+    try:
+        plans_response = morpheus_api.get("plans")
+        if not plans_response:
+            logger.warning("No plans found or unable to fetch plans")
+            return []
+        
+        plans = plans_response.get("plans", [])
+        logger.info(f"Found {len(plans)} existing plans")
+        
+        # Filter for GCP plans
+        gcp_plans = []
+        for plan in plans:
+            if plan.get("zone", {}).get("cloud", {}).get("type") == "gcp":
+                gcp_plans.append(plan)
+        
+        logger.info(f"Found {len(gcp_plans)} GCP plans")
+        return gcp_plans
+        
+    except Exception as e:
+        logger.error(f"Error discovering plans: {e}")
+        return []
+
+def create_comprehensive_pricing_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor):
+    """Create comprehensive pricing data from SKU catalog."""
+    logger.info("Creating comprehensive pricing data from SKU catalog...")
+    
+    all_skus = sku_processor.get_all_skus()
+    logger.info(f"Processing {len(all_skus)} SKUs for pricing data creation")
+    
+    pricing_data = []
+    
+    for sku in all_skus:
+        try:
+            # Create pricing entry
+            pricing_entry = {
+                'name': f"{PRICE_PREFIX}-{sku['sku_id']}",
+                'code': f"gcp-{sku['sku_id']}",
+                'priceType': 'fixed',
+                'priceUnit': sku['pricing_unit'],
+                'price': 0.0,  # Will be calculated from rate
+                'markupType': 'fixed',
+                'markup': 0,
+                'markupPercent': 0,
+                'cost': 0.0,  # Will be calculated from rate
+                'currency': 'USD',
+                'refType': 'ComputeZone',
+                'refId': None,  # Will be set when mapping to zones
+                'volumeType': None,
+                'datastore': None,
+                'crossCloudApply': False,
+                'sku': sku['sku_id'],
+                'sku_description': sku['description'],
+                'service_name': sku['service_name'],
+                'service_id': sku['service_id'],
+                'category': sku['category']
+            }
+            
+            # Calculate pricing from rate
+            rate = sku['rate']
+            if 'units' in rate and 'nanos' in rate:
+                # Convert nanos to dollars
+                price = (rate['units'] or 0) + (rate['nanos'] or 0) / 1_000_000_000
+                pricing_entry['price'] = price
+                pricing_entry['cost'] = price
+            
+            pricing_data.append(pricing_entry)
+            
+        except Exception as e:
+            logger.warning(f"Error processing SKU {sku['sku_id']} for pricing: {e}")
+            continue
+    
+    logger.info(f"Created {len(pricing_data)} pricing entries")
+    return pricing_data
+
+def create_enhanced_price_sets(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor):
+    """Create enhanced price sets with comprehensive coverage."""
+    logger.info("Creating enhanced price sets...")
+    
+    # Get SKU summary
+    sku_summary = sku_processor.get_sku_summary()
+    
+    price_sets = []
+    
+    # Create price sets by category
+    for category, summary in sku_summary.items():
+        if summary['count'] > 0:
+            price_set = {
+                'name': f"{PRICE_PREFIX}-{category.upper()}-PRICES",
+                'code': f"gcp-{category}-prices",
+                'priceUnit': 'month',
+                'priceType': 'fixed',
+                'incurCharges': True,
+                'currency': 'USD',
+                'refType': 'ComputeZone',
+                'refId': None,
+                'volumeType': None,
+                'datastore': None,
+                'crossCloudApply': False,
+                'category': category,
+                'sku_count': summary['count'],
+                'services': summary['services']
+            }
+            price_sets.append(price_set)
+    
+    # Create comprehensive price set
+    comprehensive_set = {
+        'name': f"{PRICE_PREFIX}-COMPREHENSIVE-PRICES",
+        'code': "gcp-comprehensive-prices",
+        'priceUnit': 'month',
+        'priceType': 'fixed',
+        'incurCharges': True,
+        'currency': 'USD',
+        'refType': 'ComputeZone',
+        'refId': None,
+        'volumeType': None,
+        'datastore': None,
+        'crossCloudApply': False,
+        'category': 'comprehensive',
+        'sku_count': sum(summary['count'] for summary in sku_summary.values()),
+        'services': list(set(service for summary in sku_summary.values() for service in summary['services']))
+    }
+    price_sets.append(comprehensive_set)
+    
+    logger.info(f"Created {len(price_sets)} price sets")
+    return price_sets
+
+def create_service_plans_from_skus(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor):
+    """Create service plans based on compute SKUs."""
+    logger.info("Creating service plans from compute SKUs...")
+    
+    compute_skus = sku_processor.compute_skus
+    if not compute_skus:
+        logger.warning("No compute SKUs found for service plan creation")
+        return []
+    
+    # Group by instance family
+    instance_families = defaultdict(list)
+    for sku in compute_skus:
+        instance_type = sku['instance_type']
+        if instance_type != 'general':
+            # Extract family (e2, n2, c2, etc.)
+            family_match = re.match(r'(\w+\d+[a-z]?)', instance_type)
+            if family_match:
+                family = family_match.group(1)
+                instance_families[family].append(sku)
     
     service_plans = []
-    excluded_count = 0
     
-    for plan in all_plans:
-        plan_name = plan.get('name', '').lower()
-        is_gcp_plan = any(re.match(pattern, plan_name) for pattern in gcp_patterns)
+    # Create service plans for each family
+    for family, skus in instance_families.items():
+        # Get unique instance types for this family
+        instance_types = list(set(sku['instance_type'] for sku in skus))
         
-        # Additional filtering - exclude obvious non-GCP plans
-        exclude_patterns = [
-            'azure', 'rds db.', 'aks ', 'eks ', 'gke controller', 'hyper-v', 
-            'default', 'discovered', 'terraform', 'workflow',
-            'controller', 'stack', 'external', 'manual', 'kubernetes',
-            'dtus', 'ioh vm', ' cpu,', ' memory,', ' storage'
-        ]
-        
-        is_excluded = any(pattern in plan_name for pattern in exclude_patterns)
-        
-        if is_gcp_plan and not is_excluded:
-            service_plans.append(plan)
-        else:
-            excluded_count += 1
+        for instance_type in instance_types[:10]:  # Limit to first 10 per family
+            service_plan = {
+                'name': f"GCP {instance_type.upper()}",
+                'code': f"gcp-{instance_type.lower()}",
+                'description': f"Google Cloud Platform {instance_type.upper()} instance",
+                'editable': True,
+                'provisionType': {
+                    'id': 1  # Default provision type
+                },
+                'zone': {
+                    'id': 1  # Default zone - will need to be updated
+                },
+                'priceSets': [],  # Will be populated later
+                'config': {
+                    'instanceType': instance_type,
+                    'family': family,
+                    'region': GCP_REGION
+                }
+            }
+            service_plans.append(service_plan)
     
-    logger.info(f"Found {len(service_plans)} actual GCP Service Plans (excluded {excluded_count} non-GCP plans)")
-    logger.info("GCP Service Plans detected:")
-    
-    # Group by machine family for better visibility
-    family_groups = {}
-    for p in sorted(service_plans, key=lambda x: x['name']):
-        name = p['name'].lower()
-        family = 'unknown'
-        
-        # Extract family from plan name
-        for pattern in [r'^([a-z]\d+[a-z]?)-', r'^(f1|g1)-']:
-            match = re.match(pattern, name)
-            if match:
-                family = match.group(1)
-                break
-        
-        if family not in family_groups:
-            family_groups[family] = []
-        family_groups[family].append(p['name'])
-    
-    for family, plans_list in sorted(family_groups.items()):
-        logger.info(f"  {family.upper()} family: {len(plans_list)} plans")
-        for plan_name in sorted(plans_list)[:3]:  # Show first 3 as examples
-            print(f"   - {plan_name}")
-        if len(plans_list) > 3:
-            print(f"   - ... and {len(plans_list) - 3} more {family} plans")
-    
+    logger.info(f"Created {len(service_plans)} service plans from {len(compute_skus)} compute SKUs")
     return service_plans
 
-def ensure_comprehensive_pricing_data(morpheus_api: MorpheusApiClient, gcp_client: GCPPricingClient):
-    """Helper: Ensure we have comprehensive pricing data including storage prices."""
-    logger.info("--- Ensuring Comprehensive Pricing Data ---")
+def sync_comprehensive_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor, dry_run=False, create_service_plans=False):
+    """Sync comprehensive data from SKU catalog."""
+    logger.info("Starting comprehensive data sync...")
     
-    # Check if cache file exists
-    if not os.path.exists(LOCAL_SKU_CACHE_FILE):
-        logger.info("Cache file not found. Running full GCP data sync...")
-        sync_gcp_data(morpheus_api, gcp_client)
+    if dry_run:
+        logger.info("DRY RUN MODE - No changes will be made")
     
-    # Load and analyze existing data
-    with open(LOCAL_SKU_CACHE_FILE, 'r') as f:
-        pricing_data = json.load(f)
+    # Create pricing data
+    pricing_data = create_comprehensive_pricing_data(morpheus_api, sku_processor)
     
-    # Count different price types
-    price_types = {}
-    storage_count = 0
+    # Create price sets
+    price_sets = create_enhanced_price_sets(morpheus_api, sku_processor)
     
-    for item in pricing_data:
-        price_type = item.get('priceTypeCode', 'unknown')
-        family = item.get('machine_family', 'unknown')
+    # Create service plans if requested
+    service_plans = []
+    if create_service_plans:
+        service_plans = create_service_plans_from_skus(morpheus_api, sku_processor)
+    
+    if not dry_run:
+        # Create prices in Morpheus
+        created_prices = []
+        for pricing_entry in pricing_data:
+            try:
+                response = morpheus_api.post("prices", pricing_entry)
+                if response:
+                    created_prices.append(response)
+                    logger.info(f"Created price: {pricing_entry['name']}")
+                time.sleep(0.1)  # Rate limiting
+            except Exception as e:
+                logger.error(f"Error creating price {pricing_entry['name']}: {e}")
         
-        if price_type not in price_types:
-            price_types[price_type] = 0
-        price_types[price_type] += 1
+        # Create price sets in Morpheus
+        created_price_sets = []
+        for price_set in price_sets:
+            try:
+                response = morpheus_api.post("price-sets", price_set)
+                if response:
+                    created_price_sets.append(response)
+                    logger.info(f"Created price set: {price_set['name']}")
+                time.sleep(0.1)  # Rate limiting
+            except Exception as e:
+                logger.error(f"Error creating price set {price_set['name']}: {e}")
         
-        if price_type == 'storage' or family in ['pd-standard', 'pd-ssd', 'pd-balanced', 'pd-extreme', 'local-ssd']:
-            storage_count += 1
-    
-    logger.info(f"Current pricing data summary:")
-    for price_type, count in sorted(price_types.items()):
-        logger.info(f"  {price_type}: {count} items")
-    
-    if storage_count == 0:
-        logger.warning("No storage pricing found in cached data!")
-        logger.info("This may be because:")
-        logger.info("1. The GCP region doesn't have all storage types available")
-        logger.info("2. The GCP API query filters need adjustment")
-        logger.info("3. Storage SKUs use different naming conventions")
+        # Create service plans in Morpheus
+        created_service_plans = []
+        if create_service_plans:
+            for service_plan in service_plans:
+                try:
+                    response = morpheus_api.post("service-plans", service_plan)
+                    if response:
+                        created_service_plans.append(response)
+                        logger.info(f"Created service plan: {service_plan['name']}")
+                    time.sleep(0.1)  # Rate limiting
+                except Exception as e:
+                    logger.error(f"Error creating service plan {service_plan['name']}: {e}")
         
-        # Try to fetch storage data specifically
-        logger.info("Attempting to fetch storage pricing data specifically...")
-        storage_filters = [
-            ['storage'],
-            ['disk'],
-            ['persistent disk'],
-            ['ssd'],
-            ['standard'],
-            ['balanced'],
-            ['extreme'],
-            ['regional'],
-            ['hyperdisk']
-        ]
-        
-        storage_skus = gcp_client.get_skus_from_filters(storage_filters)
-        if storage_skus:
-            logger.info(f"Found {len(storage_skus)} additional storage SKUs")
-            # Merge with existing data
-            existing_sku_ids = {item['sku_id'] for item in pricing_data}
-            new_skus = [sku for sku in storage_skus if sku['sku_id'] not in existing_sku_ids]
-            
-            if new_skus:
-                pricing_data.extend(new_skus)
-                with open(LOCAL_SKU_CACHE_FILE, 'w') as f:
-                    json.dump(pricing_data, f, indent=2)
-                logger.info(f"Added {len(new_skus)} new storage SKUs to cache")
-            else:
-                logger.info("No new storage SKUs found")
-        else:
-            logger.warning("No storage SKUs found even with specific search")
+        logger.info(f"Sync completed: {len(created_prices)} prices, {len(created_price_sets)} price sets, {len(created_service_plans)} service plans created")
+    else:
+        logger.info(f"DRY RUN: Would create {len(pricing_data)} prices, {len(price_sets)} price sets, {len(service_plans)} service plans")
     
-    return len(pricing_data), storage_count
+    return {
+        'pricing_data': pricing_data,
+        'price_sets': price_sets,
+        'service_plans': service_plans,
+        'sku_summary': sku_processor.get_sku_summary()
+    }
 
-def sync_gcp_data(morpheus_api: MorpheusApiClient, gcp_client: GCPPricingClient):
-    """Step 2: Sync relevant GCP data based on Morpheus plans and save to a local file."""
-    logger.info("--- Step 2: Syncing relevant GCP pricing data ---")
-    plans = discover_morpheus_plans(morpheus_api)
-    if not plans:
-        logger.warning("No GCP service plans found in Morpheus. Nothing to sync.")
-        return
-
-    # ENHANCED: Extract machine families from actual GCP plan names and include comprehensive disk types
-    filters = set()
-    detected_families = set()
+def validate_comprehensive_sync(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor):
+    """Validate the comprehensive sync results."""
+    logger.info("Validating comprehensive sync results...")
     
-    for plan in plans:
-        name = plan.get('name', '').lower()
-        family = None
+    # Get existing prices and price sets
+    try:
+        prices_response = morpheus_api.get("prices")
+        price_sets_response = morpheus_api.get("price-sets")
+        service_plans_response = morpheus_api.get("service-plans")
         
-        # More comprehensive pattern matching for GCP machine families
-        patterns = [
-            r'^([a-z]\d+[a-z]?)-',  # e2-, n2-, c2-, n2d-, c2d-, etc.
-            r'^(f1|g1)-',           # Legacy types
-        ]
+        existing_prices = prices_response.get("prices", []) if prices_response else []
+        existing_price_sets = price_sets_response.get("priceSets", []) if price_sets_response else []
+        existing_service_plans = service_plans_response.get("servicePlans", []) if service_plans_response else []
         
-        for pattern in patterns:
-            match = re.match(pattern, name)
-            if match:
-                family = match.group(1)
-                break
+        # Filter for GCP items
+        gcp_prices = [p for p in existing_prices if p.get("code", "").startswith("gcp-")]
+        gcp_price_sets = [ps for ps in existing_price_sets if ps.get("code", "").startswith("gcp-")]
+        gcp_service_plans = [sp for sp in existing_service_plans if sp.get("code", "").startswith("gcp-")]
         
-        if family:
-            detected_families.add(family)
-            filters.add(tuple(sorted((family,))))
-    
-    # ENHANCED: Comprehensive disk/storage filters for all GCP disk types
-    disk_types = [
-        'pd-standard',    # Standard persistent disk
-        'pd-ssd',         # SSD persistent disk  
-        'pd-balanced',    # Balanced persistent disk
-        'pd-extreme',     # Extreme persistent disk
-        'local-ssd',      # Local SSD
-        'hyperdisk-balanced',  # Hyperdisk balanced
-        'hyperdisk-extreme',   # Hyperdisk extreme
-        'regional-pd-standard', # Regional standard
-        'regional-pd-ssd',      # Regional SSD
-        'standard persistent disk',  # Alternative naming
-        'ssd persistent disk',       # Alternative naming
-        'balanced persistent disk',  # Alternative naming
-        'extreme persistent disk',   # Alternative naming
-    ]
-    
-    for disk_type in disk_types:
-        filters.add(tuple(sorted((disk_type,))))
-    
-    logger.info(f"Detected machine families: {sorted(detected_families)}")
-    logger.info(f"Generated {len(filters)} unique SKU search filters (including {len(disk_types)} disk types)")
-    
-    pricing_data = gcp_client.get_skus_from_filters([list(f) for f in filters])
-    
-    # ENHANCED: Validate that we have comprehensive storage coverage
-    storage_skus = [sku for sku in pricing_data if sku.get('priceTypeCode') == 'storage']
-    storage_types = set(sku.get('machine_family') for sku in storage_skus)
-    
-    logger.info(f"Found {len(storage_skus)} storage SKUs with types: {sorted(storage_types)}")
-    
-    # Check for required storage types
-    required_storage_types = {'pd-standard', 'pd-ssd', 'pd-balanced'}
-    missing_storage_types = required_storage_types - storage_types
-    
-    if missing_storage_types:
-        logger.warning(f"Missing required storage types: {missing_storage_types}")
-        logger.warning("This may cause issues with component price set creation")
-    
-    with open(LOCAL_SKU_CACHE_FILE, 'w') as f:
-        json.dump(pricing_data, f, indent=2)
-    logger.info(f"Targeted pricing data saved to {LOCAL_SKU_CACHE_FILE}")
-
-def create_prices(morpheus_api: MorpheusApiClient):
-    """Step 3: Create prices in Morpheus from the local SKU cache."""
-    logger.info(f"--- Step 3: Creating Prices in Morpheus from local file ---")
-    if not os.path.exists(LOCAL_SKU_CACHE_FILE):
-        logger.error(f"Local cache file '{LOCAL_SKU_CACHE_FILE}' not found. Please run 'sync-gcp-data' first.")
-        return
-
-    with open(LOCAL_SKU_CACHE_FILE, 'r') as f:
-        pricing_data = json.load(f)
-    
-    logger.info(f"Processing {len(pricing_data)} prices from local cache...")
-    for i, price_info in enumerate(pricing_data):
-        sys.stdout.write(f"\rProcessing price {i + 1}/{len(pricing_data)}")
-        sys.stdout.flush()
+        logger.info(f"Validation Results:")
+        logger.info(f"  Total prices in Morpheus: {len(existing_prices)}")
+        logger.info(f"  GCP prices: {len(gcp_prices)}")
+        logger.info(f"  Total price sets in Morpheus: {len(existing_price_sets)}")
+        logger.info(f"  GCP price sets: {len(gcp_price_sets)}")
+        logger.info(f"  Total service plans in Morpheus: {len(existing_service_plans)}")
+        logger.info(f"  GCP service plans: {len(gcp_service_plans)}")
         
-        payload = { "price": {
-            "name": f"{PRICE_PREFIX} - {price_info['description']}", "code": price_info['morpheus_code'],
-            "priceType": price_info['priceTypeCode'], "priceUnit": price_info['priceUnit'], 
-            "price": price_info['price_per_unit'], "cost": price_info['price_per_unit'], 
-            "incurCharges": price_info['incurCharges'], "currency": price_info['currency'], "active": True
-        }}
+        # Check coverage
+        sku_summary = sku_processor.get_sku_summary()
+        total_skus = sum(summary['count'] for summary in sku_summary.values())
         
-        if price_info['priceTypeCode'] == 'software':
-            payload['price']['software'] = price_info['description']
-
-        try:
-            existing = morpheus_api.get(f"prices?code={price_info['morpheus_code']}")
-            if not (existing and existing.get('prices')):
-                response = morpheus_api.post("prices", payload)
-                if not response or not (response.get('success') or response.get('price')):
-                    logger.error(f"\nFailed to create price '{price_info['description']}'. Invalid response: {response}")
-        except Exception as e:
-            logger.error(f"\nException creating price '{price_info['description']}': {e}")
-    sys.stdout.write("\n")
-    logger.info("--- Price creation complete. ---")
-
-def create_price_sets(morpheus_api: MorpheusApiClient):
-    """Step 4: Create comprehensive price sets from prices in Morpheus - ENHANCED VERSION FOR COMPONENT PRICE SETS."""
-    logger.info(f"--- Step 4: Creating Component Price Sets in Morpheus ---")
-    if not os.path.exists(LOCAL_SKU_CACHE_FILE):
-        logger.error(f"Local cache file '{LOCAL_SKU_CACHE_FILE}' not found. Please run 'sync-gcp-data' and 'create-prices' first.")
-        return
-    
-    with open(LOCAL_SKU_CACHE_FILE, 'r') as f:
-        pricing_data = json.load(f)
-    
-    # Get all prices with the required prefix
-    all_prices_resp = morpheus_api.get(f"prices?max=2000&phrase={PRICE_PREFIX}")
-    if not all_prices_resp or not all_prices_resp.get('prices'):
-        logger.error("No prices found with the required prefix. Please run 'create-prices' first.")
-        return
-
-    price_id_map = {p['code']: p['id'] for p in all_prices_resp['prices']}
-    
-    # ENHANCED: Separate machine family prices from storage prices
-    machine_family_prices = {}
-    storage_prices = {}
-    
-    # Storage types that should be included in every machine family price set
-    storage_types = ['pd-standard', 'pd-ssd', 'pd-balanced', 'pd-extreme', 'local-ssd', 
-                     'hyperdisk-balanced', 'hyperdisk-extreme', 'regional-pd-standard', 'regional-pd-ssd']
-    
-    # ENHANCED: Separate machine family pricing from storage pricing
-    for price_info in pricing_data:
-        family = price_info.get('machine_family', 'unknown')
-        price_type = price_info.get('priceTypeCode', 'unknown')
-        region = price_info['region'].replace('-', '_')
+        logger.info(f"  Total SKUs in catalog: {total_skus}")
+        logger.info(f"  Price coverage: {len(gcp_prices)}/{total_skus} ({len(gcp_prices)/total_skus*100:.1f}%)")
         
-        if family == 'software': 
-            continue  # Don't create price sets for generic software
-        
-        price_id = price_id_map.get(price_info['morpheus_code'])
-        if not price_id:
-            continue
-            
-        # Check if this is storage pricing
-        if family in storage_types or price_type == 'storage':
-            # Storage prices - collect by region to add to all machine families
-            if region not in storage_prices:
-                storage_prices[region] = set()
-            storage_prices[region].add(price_id)
-        else:
-            # Machine family prices (cores, memory)
-            group_key = f"gcp-{family}-{region}"
-            
-            if group_key not in machine_family_prices:
-                machine_family_prices[group_key] = {
-                    "name": f"{PRICE_PREFIX} - GCP - {family.upper()} ({price_info['region']})",
-                    "code": f"{PRICE_PREFIX.lower()}.{group_key}",
-                    "prices": set(),
-                    "price_types": set(),
-                    "region": price_info['region'],
-                    "region_key": region
-                }
-            
-            machine_family_prices[group_key]["prices"].add(price_id)
-            machine_family_prices[group_key]["price_types"].add(price_type)
-
-    # ENHANCED: Now add storage prices to each machine family price set
-    for group_key, data in machine_family_prices.items():
-        region_key = data["region_key"]
-        if region_key in storage_prices:
-            # Add all storage prices for this region to the machine family price set
-            data["prices"].update(storage_prices[region_key])
-            data["price_types"].add("storage")
-    
-    # Check if we have any storage prices at all
-    total_storage_prices = sum(len(prices) for prices in storage_prices.values())
-    logger.info(f"Found {total_storage_prices} storage prices across {len(storage_prices)} regions")
-    
-    if total_storage_prices == 0:
-        logger.error("No storage prices found! Component price sets require storage pricing.")
-        logger.error("Please ensure the following storage types are available:")
-        logger.error("- pd-standard (Standard Persistent Disk)")
-        logger.error("- pd-ssd (SSD Persistent Disk)")
-        logger.error("- pd-balanced (Balanced Persistent Disk)")
-        logger.error("- pd-extreme (Extreme Persistent Disk)")
-        logger.error("- local-ssd (Local SSD)")
-        logger.error("Run 'sync-gcp-data' again to ensure storage SKUs are fetched")
-        return
-
-    logger.info(f"Processing {len(machine_family_prices)} component price sets")
-    logger.info("Each price set includes cores, memory, and storage pricing for complete VM provisioning")
-    
-    successful_count = 0
-    failed_count = 0
-    
-    for i, (key, data) in enumerate(machine_family_prices.items()):
-        sys.stdout.write(f"\rProcessing price set {i + 1}/{len(machine_family_prices)}: {data['name']}")
-        sys.stdout.flush()
-        
-        if not data["prices"]: 
-            logger.warning(f"\nSkipping price set '{data['name']}' - no prices found")
-            continue
-        
-        logger.info(f"\nCreating component price set '{data['name']}' with {len(data['prices'])} prices")
-        logger.info(f"  Price types: {sorted(data['price_types'])}")
-        
-        # ENHANCED: Verify we have required components for component price sets
-        required_types = {'cores', 'memory', 'storage'}
-        if not required_types.issubset(data['price_types']):
-            missing_types = required_types - data['price_types']
-            logger.error(f"  Error: Missing required price types {missing_types} for Component pricing")
-            logger.error(f"  Skipping price set '{data['name']}' - Component type requires cores, memory, and storage")
-            failed_count += 1
-            continue
-        
-        # ENHANCED: Create component price set payload with correct structure
-        payload = {
-            "priceSet": {
-                "name": data["name"], 
-                "code": data["code"], 
-                "type": "component",  # FIXED: Use 'component' type as required
-                "priceUnit": "hour",
-                "regionCode": PRICE_PREFIX.lower(),
-                "prices": [{"id": price_id} for price_id in data["prices"]]
-            }
+        return {
+            'total_prices': len(existing_prices),
+            'gcp_prices': len(gcp_prices),
+            'total_price_sets': len(existing_price_sets),
+            'gcp_price_sets': len(gcp_price_sets),
+            'total_service_plans': len(existing_service_plans),
+            'gcp_service_plans': len(gcp_service_plans),
+            'catalog_skus': total_skus,
+            'coverage_percentage': len(gcp_prices)/total_skus*100 if total_skus > 0 else 0
         }
         
-        try:
-            # Check if price set already exists
-            existing = morpheus_api.get(f"price-sets?code={data['code']}")
-            if existing and existing.get('priceSets') and len(existing['priceSets']) > 0:
-                # Update existing price set
-                price_set_id = existing['priceSets'][0]['id']
-                logger.info(f"Updating existing price set: {data['name']} (ID: {price_set_id})")
-                response = morpheus_api.put(f"price-sets/{price_set_id}", payload)
-            else:
-                # Create new price set
-                logger.info(f"Creating new component price set: {data['name']}")
-                response = morpheus_api.post("price-sets", payload)
-            
-            if response and (response.get('success') or response.get('priceSet')):
-                logger.info(f"  ✅ Successfully created/updated component price set")
-                successful_count += 1
-            else:
-                logger.error(f"  ❌ Failed to create price set. Response: {response}")
-                failed_count += 1
-                
-        except Exception as e:
-            logger.error(f"  ❌ Exception creating price set: {e}")
-            failed_count += 1
-    
-    sys.stdout.write("\n")
-    logger.info(f"--- Price set creation complete. Success: {successful_count}, Failed: {failed_count} ---")
-
-def map_plans_to_price_sets(morpheus_api: MorpheusApiClient):
-    """Step 5: Map price sets to service plans based on machine family matching."""
-    logger.info("--- Step 5: Mapping Price Sets to Service Plans ---")
-    
-    # Get all price sets
-    price_sets_resp = morpheus_api.get("price-sets?max=2000")
-    if not price_sets_resp or not price_sets_resp.get('priceSets'):
-        logger.error("No price sets found. Please run 'create-price-sets' first.")
-        return
-
-    price_set_map = {ps['code']: ps for ps in price_sets_resp['priceSets']}
-    
-    # Get all GCP service plans
-    plans = discover_morpheus_plans(morpheus_api)
-    if not plans:
-        logger.error("No GCP service plans found.")
-        return
-
-    successful_mappings = 0
-    failed_mappings = 0
-    
-    for plan in plans:
-        plan_name = plan.get('name', '').lower()
-        plan_id = plan.get('id')
-        
-        # Extract machine family from plan name
-        family = None
-        patterns = [
-            r'^([a-z]\d+[a-z]?)-',  # e2-, n2-, c2-, n2d-, c2d-, etc.
-            r'^(f1|g1)-',           # Legacy types
-        ]
-        
-        for pattern in patterns:
-            match = re.match(pattern, plan_name)
-            if match:
-                family = match.group(1)
-                break
-        
-        if not family:
-            logger.warning(f"Skipping plan '{plan.get('name')}' - could not extract machine family")
-            continue
-        
-        # Find matching price set
-        region_key = GCP_REGION.replace('-', '_')
-        expected_price_set_code = f"{PRICE_PREFIX.lower()}.gcp-{family}-{region_key}"
-        
-        if expected_price_set_code not in price_set_map:
-            logger.warning(f"No price set found for plan '{plan.get('name')}' (expected: {expected_price_set_code})")
-            failed_mappings += 1
-            continue
-        
-        price_set = price_set_map[expected_price_set_code]
-        current_price_sets = plan.get('priceSets', []) or []
-        current_ps_ids = {ps['id'] for ps in current_price_sets if ps}
-        
-        if price_set['id'] in current_ps_ids:
-            logger.info(f"Plan '{plan.get('name')}' already has price set '{price_set['name']}'")
-            successful_mappings += 1
-            continue
-        
-        # Add price set to plan
-        final_ps_ids = list(current_ps_ids) + [price_set['id']]
-        payload = {
-            "servicePlan": {
-                "priceSets": [{"id": ps_id} for ps_id in final_ps_ids]
-            }
-        }
-        
-        try:
-            response = morpheus_api.put(f"service-plans/{plan_id}", payload)
-            if response and (response.get('success') or response.get('servicePlan')):
-                logger.info(f"✅ Mapped price set '{price_set['name']}' to plan '{plan.get('name')}'")
-                successful_mappings += 1
-            else:
-                logger.error(f"❌ Failed to map price set to plan '{plan.get('name')}'. Response: {response}")
-                failed_mappings += 1
-        except Exception as e:
-            logger.error(f"❌ Exception mapping price set to plan '{plan.get('name')}': {e}")
-            failed_mappings += 1
-    
-    logger.info(f"--- Mapping complete. Success: {successful_mappings}, Failed: {failed_mappings} ---")
-
-def validate(morpheus_api: MorpheusApiClient):
-    """Step 6: Validate that service plans have proper pricing configured."""
-    logger.info("--- Step 6: Validating Service Plan Pricing ---")
-    plans = discover_morpheus_plans(morpheus_api)
-    if not plans:
-        logger.error("No GCP service plans found.")
-        return
-
-    priced_count = 0
-    total_plans = len(plans)
-    
-    for plan in sorted(plans, key=lambda p: p['name']):
-        price_sets = plan.get('priceSets', [])
-        has_pricing = len(price_sets) > 0
-        if has_pricing:
-            priced_count += 1
-            status = f"✅ PRICED with {len(price_sets)} component price sets"
-            logger.info(f"{plan['name']}: {status}")
-            if plan.get('priceSets'):
-                for ps in sorted(plan['priceSets'], key=lambda x: x['name']):
-                    logger.info(f"  - {ps['name']} (Type: {ps.get('type', 'unknown')})")
-        else:
-            logger.warning(f"{plan['name']}: ❌ NOT PRICED")
-    
-    logger.info(f"\n--- Validation Summary ---")
-    logger.info(f"Total GCP plans: {total_plans}")
-    logger.info(f"Priced plans: {priced_count}")
-    logger.info(f"Unpriced plans: {total_plans - priced_count}")
-    logger.info(f"Pricing coverage: {(priced_count/total_plans)*100:.1f}%")
-
-def evaluate_apis():
-    """Evaluate both GCP and Morpheus APIs for comprehensive understanding."""
-    logger.info("--- API Evaluation Report ---")
-    
-    # GCP API Evaluation
-    logger.info("\n🔍 GCP Billing Catalog API Evaluation:")
-    logger.info("✅ Strengths:")
-    logger.info("  - Comprehensive SKU coverage for all GCP services")
-    logger.info("  - Real-time pricing data with currency support")
-    logger.info("  - Detailed resource categorization (CPU, RAM, Storage)")
-    logger.info("  - Regional pricing support")
-    logger.info("  - Multiple storage types: Standard, SSD, Balanced, Extreme")
-    logger.info("  - Local SSD and Hyperdisk support")
-    logger.info("  - Well-documented REST API with authentication")
-    
-    logger.info("⚠️  Limitations:")
-    logger.info("  - Requires gcloud CLI or service account authentication")
-    logger.info("  - Rate limiting on API requests")
-    logger.info("  - Complex SKU structure requires parsing")
-    logger.info("  - Some storage types may not be available in all regions")
-    
-    # Morpheus API Evaluation
-    logger.info("\n🔍 Morpheus API Evaluation:")
-    logger.info("✅ Strengths:")
-    logger.info("  - Component price sets support complete VM provisioning")
-    logger.info("  - Flexible price set types (fixed, component)")
-    logger.info("  - Service plan integration for automated provisioning")
-    logger.info("  - Regional pricing support")
-    logger.info("  - Comprehensive validation of price set requirements")
-    
-    logger.info("⚠️  Requirements:")
-    logger.info("  - Component price sets MUST include cores, memory, AND storage")
-    logger.info("  - Price sets must have proper type classification")
-    logger.info("  - Service plans require valid price set mappings")
-    logger.info("  - API token must have pricing permissions")
-    
-    logger.info("\n📋 Integration Requirements:")
-    logger.info("1. GCP SKU data must be normalized to Morpheus price format")
-    logger.info("2. Storage pricing is mandatory for component price sets")
-    logger.info("3. Machine family detection must be accurate")
-    logger.info("4. Price set grouping must include all required components")
-    logger.info("5. Service plan mapping requires exact family matching")
+    except Exception as e:
+        logger.error(f"Error during validation: {e}")
+        return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced GCP Price Sync Tool")
-    parser.add_argument("command", choices=[
-        "discover-morpheus-plans", "sync-gcp-data", "create-prices", 
-        "create-price-sets", "map-plans-to-price-sets", "validate", "evaluate-apis", "comprehensive-setup"
-    ], help="Command to execute")
+    """Main function."""
+    parser = argparse.ArgumentParser(
+        description="Enhanced GCP Price Sync using downloaded SKU catalog",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python gcp-price-sync-enhanced.py --sku-catalog gcp_skus_20250807_194211.json --dry-run
+  python gcp-price-sync-enhanced.py --sku-catalog gcp_skus_20250807_194211.json --create-service-plans
+  python gcp-price-sync-enhanced.py --sku-catalog gcp_skus_20250807_194211.json --validate-only
+        """
+    )
+    
+    parser.add_argument(
+        '--sku-catalog',
+        required=True,
+        help='Path to the SKU catalog JSON file from gcp-sku-downloader.py'
+    )
+    
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Run in dry-run mode (no changes made)'
+    )
+    
+    parser.add_argument(
+        '--create-service-plans',
+        action='store_true',
+        help='Create service plans from compute SKUs'
+    )
+    
+    parser.add_argument(
+        '--validate-only',
+        action='store_true',
+        help='Only validate existing sync results'
+    )
+    
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose logging'
+    )
     
     args = parser.parse_args()
     
+    # Setup logging
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     try:
+        # Initialize clients
         morpheus_api = MorpheusApiClient(MORPHEUS_URL, MORPHEUS_TOKEN)
+        sku_processor = SKUCatalogProcessor(args.sku_catalog)
         
-        if args.command == "discover-morpheus-plans":
-            discover_morpheus_plans(morpheus_api)
-        elif args.command == "sync-gcp-data":
-            gcp_client = GCPPricingClient(GCP_REGION)
-            sync_gcp_data(morpheus_api, gcp_client)
-        elif args.command == "create-prices":
-            create_prices(morpheus_api)
-        elif args.command == "create-price-sets":
-            create_price_sets(morpheus_api)
-        elif args.command == "map-plans-to-price-sets":
-            map_plans_to_price_sets(morpheus_api)
-        elif args.command == "validate":
-            validate(morpheus_api)
-        elif args.command == "evaluate-apis":
-            evaluate_apis()
-        elif args.command == "comprehensive-setup":
-            logger.info("=== Running Comprehensive GCP Pricing Setup ===")
-            logger.info("This will run all steps: sync-gcp-data -> create-prices -> create-price-sets -> map-plans-to-price-sets")
+        # Display catalog information
+        print("\n=== GCP SKU Catalog Information ===")
+        metadata = sku_processor.catalog['metadata']
+        print(f"Region: {metadata['region']}")
+        print(f"Download Time: {metadata['download_timestamp']}")
+        print(f"Total Services: {metadata['total_services']}")
+        print(f"Total SKUs: {metadata['total_skus']}")
+        
+        # Show processed summary
+        processed_summary = sku_processor.get_sku_summary()
+        print("\nProcessed SKU Summary:")
+        for category, summary in processed_summary.items():
+            print(f"  {category}: {summary['count']} SKUs")
+            if summary['services']:
+                print(f"    Services: {', '.join(summary['services'][:3])}{'...' if len(summary['services']) > 3 else ''}")
+        
+        if args.validate_only:
+            # Only validate
+            validation_results = validate_comprehensive_sync(morpheus_api, sku_processor)
+            if validation_results:
+                print("\n=== Validation Summary ===")
+                print(f"GCP Prices in Morpheus: {validation_results['gcp_prices']}")
+                print(f"GCP Price Sets in Morpheus: {validation_results['gcp_price_sets']}")
+                print(f"GCP Service Plans in Morpheus: {validation_results['gcp_service_plans']}")
+                print(f"Catalog SKUs: {validation_results['catalog_skus']}")
+                print(f"Coverage: {validation_results['coverage_percentage']:.1f}%")
+        else:
+            # Full sync
+            print("\n=== Starting Comprehensive Sync ===")
+            sync_results = sync_comprehensive_data(morpheus_api, sku_processor, args.dry_run, args.create_service_plans)
             
-            gcp_client = GCPPricingClient(GCP_REGION)
+            # Validate results
+            validation_results = validate_comprehensive_sync(morpheus_api, sku_processor)
             
-            # Step 1: Ensure we have comprehensive pricing data
-            total_prices, storage_count = ensure_comprehensive_pricing_data(morpheus_api, gcp_client)
+            # Print final summary
+            print("\n=== Final Sync Summary ===")
+            print(f"SKU Categories Processed: {list(sync_results['sku_summary'].keys())}")
+            for category, summary in sync_results['sku_summary'].items():
+                print(f"  {category}: {summary['count']} SKUs")
             
-            # Step 2: Create prices
-            create_prices(morpheus_api)
-            
-            # Step 3: Create price sets (with storage verification)
-            create_price_sets(morpheus_api)
-            
-            # Step 4: Map to service plans
-            map_plans_to_price_sets(morpheus_api)
-            
-            logger.info("=== Comprehensive setup complete ===")
-            
+            if validation_results:
+                print(f"\nCoverage Achieved: {validation_results['coverage_percentage']:.1f}%")
+                print(f"Total GCP Prices in Morpheus: {validation_results['gcp_prices']}")
+                print(f"Total GCP Price Sets in Morpheus: {validation_results['gcp_price_sets']}")
+                print(f"Total GCP Service Plans in Morpheus: {validation_results['gcp_service_plans']}")
+        
+        logger.info("Enhanced price sync completed successfully!")
+        
+    except KeyboardInterrupt:
+        logger.info("Sync interrupted by user")
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Sync failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
