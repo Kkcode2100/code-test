@@ -1,0 +1,206 @@
+{
+  "metadata": {
+    "region": "asia-southeast2",
+    "download_timestamp": "2025-08-07T19:44:06.432082",
+    "total_services": 1795,
+    "total_skus": 1905
+  },
+  "sku_summary": {
+    "Storage": 137,
+    "Network": 716,
+    "ApplicationServices": 672,
+    "Compute": 380
+  },
+  "category_summary": {
+    "Storage": 137,
+    "Network": 716,
+    "ApplicationServices": 672,
+    "Compute": 380
+  },
+  "services_summary": {
+    "116A-ED39-D1F0": {
+      "display_name": "Database Migration",
+      "sku_count": 2
+    },
+    "149C-F9EC-3994": {
+      "display_name": "Artifact Registry",
+      "sku_count": 3
+    },
+    "152E-C115-5142": {
+      "display_name": "Cloud Run",
+      "sku_count": 17
+    },
+    "16B8-3DDA-9F10": {
+      "display_name": "BigQuery Reservation API",
+      "sku_count": 16
+    },
+    "1992-3666-B975": {
+      "display_name": "Cloud Composer",
+      "sku_count": 27
+    },
+    "24E6-581D-38E5": {
+      "display_name": "BigQuery",
+      "sku_count": 8
+    },
+    "29E7-DA93-CA13": {
+      "display_name": "Cloud Run Functions",
+      "sku_count": 12
+    },
+    "363B-8851-170D": {
+      "display_name": "Dataproc",
+      "sku_count": 11
+    },
+    "36A9-155B-23F0": {
+      "display_name": "API Gateway",
+      "sku_count": 3
+    },
+    "3A1B-66C4-2BAE": {
+      "display_name": "Pub/Sub Lite",
+      "sku_count": 3
+    },
+    "3C58-66D1-EF70": {
+      "display_name": "Firebase Data Connect",
+      "sku_count": 8
+    },
+    "3DAD-299B-0D94": {
+      "display_name": "Backup and DR Service",
+      "sku_count": 1
+    },
+    "51C6-B3F5-9B38": {
+      "display_name": "Dataplex",
+      "sku_count": 4
+    },
+    "5490-F7B7-8DF6": {
+      "display_name": "Cloud Logging",
+      "sku_count": 1
+    },
+    "553C-B04D-D751": {
+      "display_name": "Developer Connect",
+      "sku_count": 15
+    },
+    "57D6-8E6B-2DE0": {
+      "display_name": "Cloud Dataflow",
+      "sku_count": 34
+    },
+    "5AF5-2C11-D467": {
+      "display_name": "Cloud Memorystore for Redis",
+      "sku_count": 28
+    },
+    "650B-3C82-34DB": {
+      "display_name": "BigQuery BI Engine",
+      "sku_count": 2
+    },
+    "6F81-5844-456A": {
+      "display_name": "Compute Engine",
+      "sku_count": 784
+    },
+    "7766-403C-6D6E": {
+      "display_name": "Certificate Manager",
+      "sku_count": 1
+    },
+    "7929-AEC3-626F": {
+      "display_name": "Backup for GKE",
+      "sku_count": 11
+    },
+    "7C43-DC47-72C5": {
+      "display_name": "Transfer Appliance",
+      "sku_count": 24
+    },
+    "7C52-19D8-71EE": {
+      "display_name": "Cloud Healthcare",
+      "sku_count": 7
+    },
+    "7EC6-CE53-9E39": {
+      "display_name": "Datastream",
+      "sku_count": 2
+    },
+    "8B5D-EF7D-EB12": {
+      "display_name": "Cloud Build",
+      "sku_count": 3
+    },
+    "9544-7B1C-811D": {
+      "display_name": "Managed Service for Apache Kafka",
+      "sku_count": 11
+    },
+    "95FF-2EF5-5EA1": {
+      "display_name": "Cloud Storage",
+      "sku_count": 21
+    },
+    "9662-B51E-5089": {
+      "display_name": "Cloud SQL",
+      "sku_count": 404
+    },
+    "9C2E-5AAC-D058": {
+      "display_name": "Cloud Memorystore for Memcached",
+      "sku_count": 4
+    },
+    "9C87-5BCE-65DD": {
+      "display_name": "Storage Insights",
+      "sku_count": 1
+    },
+    "A2B5-E0F1-B0F3": {
+      "display_name": "Cloud Memorystore",
+      "sku_count": 13
+    },
+    "B384-1FDE-A709": {
+      "display_name": "Managed Lustre",
+      "sku_count": 4
+    },
+    "C3BE-24A5-0975": {
+      "display_name": "Cloud Bigtable",
+      "sku_count": 8
+    },
+    "C49F-B7F2-7416": {
+      "display_name": "AlloyDB",
+      "sku_count": 15
+    },
+    "C7E2-9256-1C43": {
+      "display_name": "Vertex AI",
+      "sku_count": 185
+    },
+    "CC63-0873-48FD": {
+      "display_name": "Cloud Spanner",
+      "sku_count": 14
+    },
+    "CCD8-9BF1-090E": {
+      "display_name": "Kubernetes Engine",
+      "sku_count": 31
+    },
+    "D73B-5EEA-8215": {
+      "display_name": "Notebooks",
+      "sku_count": 54
+    },
+    "D97E-AB26-5D95": {
+      "display_name": "Cloud Filestore",
+      "sku_count": 15
+    },
+    "DCC9-8DB9-673F": {
+      "display_name": "BigQuery Storage API",
+      "sku_count": 5
+    },
+    "E505-1604-58F8": {
+      "display_name": "Networking",
+      "sku_count": 33
+    },
+    "EE2C-7FAC-5E08": {
+      "display_name": "Cloud Firestore",
+      "sku_count": 18
+    },
+    "EE2F-D110-890C": {
+      "display_name": "Cloud Key Management Service (KMS)",
+      "sku_count": 28
+    },
+    "F17B-412E-CB64": {
+      "display_name": "App Engine",
+      "sku_count": 2
+    },
+    "F3A6-D7B7-9BDA": {
+      "display_name": "Cloud Tasks",
+      "sku_count": 2
+    },
+    "FC86-5113-7C81": {
+      "display_name": "NetApp Volumes",
+      "sku_count": 10
+    }
+  }
+}
