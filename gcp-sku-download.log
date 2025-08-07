@@ -1,3 +1,6 @@
 2025-08-07 06:47:37,984 - INFO - Fetching GCP access token from gcloud CLI...
 2025-08-07 06:47:37,985 - ERROR - Unexpected error getting access token: [Errno 2] No such file or directory: 'gcloud'
 2025-08-07 06:47:37,985 - ERROR - Download failed: [Errno 2] No such file or directory: 'gcloud'
+2025-08-07 06:56:29,181 - INFO - Fetching GCP access token from gcloud CLI...
+2025-08-07 06:56:29,182 - ERROR - Unexpected error getting access token: [Errno 2] No such file or directory: 'gcloud'
+2025-08-07 06:56:29,183 - ERROR - Download failed: [Errno 2] No such file or directory: 'gcloud'

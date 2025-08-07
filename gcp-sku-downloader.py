@@ -160,8 +160,7 @@ class GCPBillingCatalogClient:
         
         while True:
             params = {
-                'pageSize': 100,
-                'filter': f'serviceRegions:{self.region}'
+                'pageSize': 100
             }
             if page_token:
                 params['pageToken'] = page_token
@@ -169,7 +168,16 @@ class GCPBillingCatalogClient:
             try:
                 data = self._make_request(f'/v1/services/{service_id}/skus', params)
                 service_skus = data.get('skus', [])
-                skus.extend(service_skus)
+                
+                # Filter SKUs by region after fetching
+                region_skus = []
+                for sku in service_skus:
+                    # Check if the SKU is available in the specified region
+                    service_regions = sku.get('serviceRegions', [])
+                    if self.region in service_regions:
+                        region_skus.append(sku)
+                
+                skus.extend(region_skus)
                 
                 page_token = data.get('nextPageToken')
                 if not page_token:
