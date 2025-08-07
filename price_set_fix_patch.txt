@@ -1,0 +1,94 @@
+# GCP Price Sync - Price Set Fix Patch
+# Apply these changes to fix the component price set creation issue
+
+## CRITICAL FIXES TO APPLY:
+
+### 1. Fix Price Set Type (Line ~577 in create_price_sets function)
+CHANGE FROM:
+"type": "fixed"
+
+CHANGE TO:
+"type": "component"  # FIXED: Use 'component' type as required
+
+### 2. Add Component Validation (Add before price set creation)
+ADD THIS CODE:
+# ENHANCED: Verify we have required components for component price sets
+required_types = {'cores', 'memory', 'storage'}
+if not required_types.issubset(data['price_types']):
+    missing_types = required_types - data['price_types']
+    logger.error(f"  Error: Missing required price types {missing_types} for Component pricing")
+    logger.error(f"  Skipping price set '{data['name']}' - Component type requires cores, memory, and storage")
+    failed_count += 1
+    continue
+
+### 3. Enhanced Storage Detection (In _normalize_gcp_sku function)
+REPLACE the storage detection section with:
+# ENHANCED: Comprehensive disk type detection
+if 'local ssd' in description or 'local-ssd' in description:
+    machine_family_heuristic = 'local-ssd'
+elif 'hyperdisk' in description and 'balanced' in description:
+    machine_family_heuristic = 'hyperdisk-balanced'
+elif 'hyperdisk' in description and 'extreme' in description:
+    machine_family_heuristic = 'hyperdisk-extreme'
+elif 'pd-extreme' in description or ('extreme' in description and 'persistent' in description):
+    machine_family_heuristic = 'pd-extreme'
+elif 'pd-balanced' in description or ('balanced' in description and 'persistent' in description):
+    machine_family_heuristic = 'pd-balanced'
+elif 'pd-ssd' in description or ('ssd' in description and 'persistent' in description and 'standard' not in description):
+    machine_family_heuristic = 'pd-ssd'
+elif 'regional' in description and 'ssd' in description:
+    machine_family_heuristic = 'regional-pd-ssd'
+elif 'regional' in description and 'standard' in description:
+    machine_family_heuristic = 'regional-pd-standard'
+elif 'standard' in description and 'persistent' in description:
+    machine_family_heuristic = 'pd-standard'
+else:
+    # Default to standard if unclear
+    machine_family_heuristic = 'pd-standard'
+
+### 4. Enhanced Storage Filters (In sync_gcp_data function)
+REPLACE the disk_types list with:
+disk_types = [
+    'pd-standard',    # Standard persistent disk
+    'pd-ssd',         # SSD persistent disk  
+    'pd-balanced',    # Balanced persistent disk
+    'pd-extreme',     # Extreme persistent disk
+    'local-ssd',      # Local SSD
+    'hyperdisk-balanced',  # Hyperdisk balanced
+    'hyperdisk-extreme',   # Hyperdisk extreme
+    'regional-pd-standard', # Regional standard
+    'regional-pd-ssd',      # Regional SSD
+    'standard persistent disk',  # Alternative naming
+    'ssd persistent disk',       # Alternative naming
+    'balanced persistent disk',  # Alternative naming
+    'extreme persistent disk',   # Alternative naming
+]
+
+### 5. Add Storage Validation (In sync_gcp_data function)
+ADD AFTER pricing_data = gcp_client.get_skus_from_filters([list(f) for f in filters]):
+# ENHANCED: Validate that we have comprehensive storage coverage
+storage_skus = [sku for sku in pricing_data if sku.get('priceTypeCode') == 'storage']
+storage_types = set(sku.get('machine_family') for sku in storage_skus)
+
+logger.info(f"Found {len(storage_skus)} storage SKUs with types: {sorted(storage_types)}")
+
+# Check for required storage types
+required_storage_types = {'pd-standard', 'pd-ssd', 'pd-balanced'}
+missing_storage_types = required_storage_types - storage_types
+
+if missing_storage_types:
+    logger.warning(f"Missing required storage types: {missing_storage_types}")
+    logger.warning("This may cause issues with component price set creation")
+
+## SUMMARY OF CHANGES:
+1. ✅ Fixed price set type from "fixed" to "component"
+2. ✅ Added validation for required components (cores, memory, storage)
+3. ✅ Enhanced storage type detection for all GCP disk types
+4. ✅ Added comprehensive storage filters
+5. ✅ Added storage coverage validation
+
+## USAGE:
+After applying these fixes, run:
+python3 your-script.py create-price-sets
+
+The script will now create proper component price sets with cores, memory, and storage included.
