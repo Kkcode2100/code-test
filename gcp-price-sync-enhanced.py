@@ -179,27 +179,24 @@ class GCPPricingClient:
         elif resource_family == "STORAGE":
             if resource_group == "DISK": 
                 price_type_code = 'storage'
-                # ENHANCED: Comprehensive disk type detection
-                if 'local ssd' in description or 'local-ssd' in description:
+                # FIXED: Better disk type detection from description
+                if 'ssd' in description and 'local' in description:
                     machine_family_heuristic = 'local-ssd'
                 elif 'hyperdisk' in description and 'balanced' in description:
                     machine_family_heuristic = 'hyperdisk-balanced'
                 elif 'hyperdisk' in description and 'extreme' in description:
                     machine_family_heuristic = 'hyperdisk-extreme'
-                elif 'pd-extreme' in description or ('extreme' in description and 'persistent' in description):
+                elif 'pd-extreme' in description or 'extreme' in description:
                     machine_family_heuristic = 'pd-extreme'
-                elif 'pd-balanced' in description or ('balanced' in description and 'persistent' in description):
+                elif 'pd-balanced' in description or 'balanced' in description:
                     machine_family_heuristic = 'pd-balanced'
-                elif 'pd-ssd' in description or ('ssd' in description and 'persistent' in description and 'standard' not in description):
+                elif 'pd-ssd' in description or ('ssd' in description and 'persistent' in description):
                     machine_family_heuristic = 'pd-ssd'
                 elif 'regional' in description and 'ssd' in description:
                     machine_family_heuristic = 'regional-pd-ssd'
-                elif 'regional' in description and 'standard' in description:
+                elif 'regional' in description:
                     machine_family_heuristic = 'regional-pd-standard'
-                elif 'standard' in description and 'persistent' in description:
-                    machine_family_heuristic = 'pd-standard'
                 else:
-                    # Default to standard if unclear
                     machine_family_heuristic = 'pd-standard'
         
         usage_unit_desc = pricing_info.get('pricingExpression', {}).get('usageUnitDescription', '').lower()
@@ -280,6 +277,78 @@ def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
             print(f"   - ... and {len(plans_list) - 3} more {family} plans")
     
     return service_plans
+
+def ensure_comprehensive_pricing_data(morpheus_api: MorpheusApiClient, gcp_client: GCPPricingClient):
+    """Helper: Ensure we have comprehensive pricing data including storage prices."""
+    logger.info("--- Ensuring Comprehensive Pricing Data ---")
+    
+    # Check if cache file exists
+    if not os.path.exists(LOCAL_SKU_CACHE_FILE):
+        logger.info("Cache file not found. Running full GCP data sync...")
+        sync_gcp_data(morpheus_api, gcp_client)
+    
+    # Load and analyze existing data
+    with open(LOCAL_SKU_CACHE_FILE, 'r') as f:
+        pricing_data = json.load(f)
+    
+    # Count different price types
+    price_types = {}
+    storage_count = 0
+    
+    for item in pricing_data:
+        price_type = item.get('priceTypeCode', 'unknown')
+        family = item.get('machine_family', 'unknown')
+        
+        if price_type not in price_types:
+            price_types[price_type] = 0
+        price_types[price_type] += 1
+        
+        if price_type == 'storage' or family in ['pd-standard', 'pd-ssd', 'pd-balanced', 'pd-extreme', 'local-ssd']:
+            storage_count += 1
+    
+    logger.info(f"Current pricing data summary:")
+    for price_type, count in sorted(price_types.items()):
+        logger.info(f"  {price_type}: {count} items")
+    
+    if storage_count == 0:
+        logger.warning("No storage pricing found in cached data!")
+        logger.info("This may be because:")
+        logger.info("1. The GCP region doesn't have all storage types available")
+        logger.info("2. The GCP API query filters need adjustment")
+        logger.info("3. Storage SKUs use different naming conventions")
+        
+        # Try to fetch storage data specifically
+        logger.info("Attempting to fetch storage pricing data specifically...")
+        storage_filters = [
+            ['storage'],
+            ['disk'],
+            ['persistent disk'],
+            ['ssd'],
+            ['standard'],
+            ['balanced'],
+            ['extreme'],
+            ['regional'],
+            ['hyperdisk']
+        ]
+        
+        storage_skus = gcp_client.get_skus_from_filters(storage_filters)
+        if storage_skus:
+            logger.info(f"Found {len(storage_skus)} additional storage SKUs")
+            # Merge with existing data
+            existing_sku_ids = {item['sku_id'] for item in pricing_data}
+            new_skus = [sku for sku in storage_skus if sku['sku_id'] not in existing_sku_ids]
+            
+            if new_skus:
+                pricing_data.extend(new_skus)
+                with open(LOCAL_SKU_CACHE_FILE, 'w') as f:
+                    json.dump(pricing_data, f, indent=2)
+                logger.info(f"Added {len(new_skus)} new storage SKUs to cache")
+            else:
+                logger.info("No new storage SKUs found")
+        else:
+            logger.warning("No storage SKUs found even with specific search")
+    
+    return len(pricing_data), storage_count
 
 def sync_gcp_data(morpheus_api: MorpheusApiClient, gcp_client: GCPPricingClient):
     """Step 2: Sync relevant GCP data based on Morpheus plans and save to a local file."""
@@ -701,7 +770,7 @@ def main():
     parser = argparse.ArgumentParser(description="Enhanced GCP Price Sync Tool")
     parser.add_argument("command", choices=[
         "discover-morpheus-plans", "sync-gcp-data", "create-prices", 
-        "create-price-sets", "map-plans-to-price-sets", "validate", "evaluate-apis"
+        "create-price-sets", "map-plans-to-price-sets", "validate", "evaluate-apis", "comprehensive-setup"
     ], help="Command to execute")
     
     args = parser.parse_args()
@@ -724,6 +793,25 @@ def main():
             validate(morpheus_api)
         elif args.command == "evaluate-apis":
             evaluate_apis()
+        elif args.command == "comprehensive-setup":
+            logger.info("=== Running Comprehensive GCP Pricing Setup ===")
+            logger.info("This will run all steps: sync-gcp-data -> create-prices -> create-price-sets -> map-plans-to-price-sets")
+            
+            gcp_client = GCPPricingClient(GCP_REGION)
+            
+            # Step 1: Ensure we have comprehensive pricing data
+            total_prices, storage_count = ensure_comprehensive_pricing_data(morpheus_api, gcp_client)
+            
+            # Step 2: Create prices
+            create_prices(morpheus_api)
+            
+            # Step 3: Create price sets (with storage verification)
+            create_price_sets(morpheus_api)
+            
+            # Step 4: Map to service plans
+            map_plans_to_price_sets(morpheus_api)
+            
+            logger.info("=== Comprehensive setup complete ===")
             
     except Exception as e:
         logger.error(f"Fatal error: {e}")
