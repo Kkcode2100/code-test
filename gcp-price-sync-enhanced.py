@@ -13,7 +13,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- Configuration ---
-MORPHEUS_URL = os.getenv("MORPHEUS_URL", "https://xdjmorpheapp01")
+MORPHEUS_URL = os.getenv("MORPHEUS_URL", "https://localhost")  # Change this to your actual Morpheus server URL
 MORPHEUS_TOKEN = os.getenv("MORPHEUS_TOKEN", "9fcc4426-c89a-4430-b6d7-99d5950fc1cc")
 GCP_REGION = os.getenv("GCP_REGION", "asia-southeast2")
 PRICE_PREFIX = os.getenv("PRICE_PREFIX", "IOH-CP")
@@ -45,6 +45,14 @@ class MorpheusApiClient:
             response = self.session.request(method, url, json=payload, headers=self.headers, params=params, verify=False)
             response.raise_for_status()
             return response.json() if response.content else None
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection Error: Cannot connect to Morpheus server at {self.base_url}")
+            logger.error(f"Please verify:")
+            logger.error(f"  1. Morpheus server is running and accessible")
+            logger.error(f"  2. MORPHEUS_URL is correct (current: {self.base_url})")
+            logger.error(f"  3. Network connectivity to the server")
+            logger.error(f"  4. Firewall allows connections on port 443")
+            raise
         except requests.exceptions.HTTPError as e:
             if response.status_code != 404:
                 logger.error(f"HTTP Error for {method.upper()} {endpoint}: {e.response.status_code} - {e.response.text}")
