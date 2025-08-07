@@ -212,23 +212,68 @@ class GCPPricingClient:
 # --- Modular Functions ---
 
 def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
-    """Step 1: Discover GCP service plans in Morpheus."""
-    logger.info("--- Step 1: Discovering GCP Service Plans in Morpheus ---")
-    plans_resp = morpheus_api.get("service-plans?max=2000")
-    if not plans_resp or not plans_resp.get('servicePlans'):
-        logger.error("No service plans found in Morpheus.")
-        return []
-
-    gcp_plans = []
-    for plan in plans_resp['servicePlans']:
-        if plan.get('provisionType', {}).get('code') == 'gcp':
-            gcp_plans.append(plan)
-
-    logger.info(f"Found {len(gcp_plans)} GCP service plans in Morpheus.")
-    for plan in sorted(gcp_plans, key=lambda p: p['name']):
-        logger.info(f"  - {plan['name']}")
+    """Step 1: Discover Google service plans from Morpheus - FIXED TO FILTER ONLY GCP PLANS."""
+    logger.info("--- Step 1: Discovering Morpheus Service Plans ---")
+    plans = morpheus_api.get("service-plans?provisionTypeCode=google&max=1000")
+    all_plans = plans.get('servicePlans', []) if plans else []
     
-    return gcp_plans
+    # FIXED: Filter to only include actual GCP machine types, exclude non-GCP plans
+    gcp_patterns = [
+        r'^[a-z]\d+[a-z]?-',  # Standard GCP patterns like e2-, n2-, c2-, etc.
+        r'^f1-micro$', r'^g1-small$',  # Legacy GCP types
+        r'^[a-z]\d+-custom',  # Custom machine types
+    ]
+    
+    service_plans = []
+    excluded_count = 0
+    
+    for plan in all_plans:
+        plan_name = plan.get('name', '').lower()
+        is_gcp_plan = any(re.match(pattern, plan_name) for pattern in gcp_patterns)
+        
+        # Additional filtering - exclude obvious non-GCP plans
+        exclude_patterns = [
+            'azure', 'rds db.', 'aks ', 'eks ', 'gke controller', 'hyper-v', 
+            'default', 'discovered', 'terraform', 'workflow',
+            'controller', 'stack', 'external', 'manual', 'kubernetes',
+            'dtus', 'ioh vm', ' cpu,', ' memory,', ' storage'
+        ]
+        
+        is_excluded = any(pattern in plan_name for pattern in exclude_patterns)
+        
+        if is_gcp_plan and not is_excluded:
+            service_plans.append(plan)
+        else:
+            excluded_count += 1
+    
+    logger.info(f"Found {len(service_plans)} actual GCP Service Plans (excluded {excluded_count} non-GCP plans)")
+    logger.info("GCP Service Plans detected:")
+    
+    # Group by machine family for better visibility
+    family_groups = {}
+    for p in sorted(service_plans, key=lambda x: x['name']):
+        name = p['name'].lower()
+        family = 'unknown'
+        
+        # Extract family from plan name
+        for pattern in [r'^([a-z]\d+[a-z]?)-', r'^(f1|g1)-']:
+            match = re.match(pattern, name)
+            if match:
+                family = match.group(1)
+                break
+        
+        if family not in family_groups:
+            family_groups[family] = []
+        family_groups[family].append(p['name'])
+    
+    for family, plans_list in sorted(family_groups.items()):
+        logger.info(f"  {family.upper()} family: {len(plans_list)} plans")
+        for plan_name in sorted(plans_list)[:3]:  # Show first 3 as examples
+            print(f"   - {plan_name}")
+        if len(plans_list) > 3:
+            print(f"   - ... and {len(plans_list) - 3} more {family} plans")
+    
+    return service_plans
 
 def sync_gcp_data(morpheus_api: MorpheusApiClient, gcp_client: GCPPricingClient):
     """Step 2: Sync relevant GCP data based on Morpheus plans and save to a local file."""
