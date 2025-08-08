@@ -681,6 +681,29 @@ def validate_sync(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProc
         return None
 
 
+def _print_plans_summary(plans: list[dict]):
+    """Print grouped summary of GCP plans by machine family with examples."""
+    from collections import defaultdict
+    family_groups: dict[str, list[str]] = defaultdict(list)
+    for p in plans:
+        name = (p.get('name') or '').lower()
+        family = 'unknown'
+        for pattern in [r'^([a-z]\d+[a-z]?)-', r'^(f1|g1)-']:
+            m = re.match(pattern, name)
+            if m:
+                family = m.group(1)
+                break
+        family_groups[family].append(p.get('name') or '')
+    logger.info(f"Found {len(plans)} actual GCP Service Plans (grouped by family):")
+    for family in sorted(family_groups.keys()):
+        items = sorted(family_groups[family])
+        logger.info(f"  {family.upper()} family: {len(items)} plans")
+        for example in items[:3]:
+            print(f"   - {example}")
+        if len(items) > 3:
+            print(f"   - ... and {len(items) - 3} more {family} plans")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Final unified GCP price sync using downloaded SKU catalog",
@@ -701,6 +724,7 @@ def main():
     parser.add_argument('--create-price-sets', action='store_true', help='Create price sets from SKU catalog summary')
     parser.add_argument('--map-to-plans', action='store_true', help='Map created price sets to discovered GCP service plans')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--discover-morpheus-plans', action='store_true', help='Discover and print GCP service plans, then exit')
     args = parser.parse_args()
 
     if args.verbose:
@@ -710,8 +734,14 @@ def main():
         morpheus_api = MorpheusApiClient(MORPHEUS_URL, MORPHEUS_TOKEN)
         sku_processor = SKUCatalogProcessor(args.sku_catalog)
 
-        # Discover existing GCP service plans up front (to scope actions)
+        # Discover existing GCP service plans
         discovered_plans = discover_morpheus_plans(morpheus_api)
+
+        if args.discover_morpheus_plans:
+            # Print grouped summary and exit
+            _print_plans_summary(discovered_plans)
+            logger.info("Discovery-only run complete.")
+            return
         if not discovered_plans:
             logger.warning("No GCP service plans discovered in Morpheus.")
             if not args.validate_only:
