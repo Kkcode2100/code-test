@@ -591,6 +591,11 @@ def main():
                 if not args.dry_run and discovered_plans:
                     for pricing_entry in pricing_data:
                         try:
+                            # Idempotency: skip if price already exists
+                            existing = morpheus_api.get(f"prices?code={pricing_entry['code']}")
+                            if existing and existing.get('prices'):
+                                logger.debug(f"Skipping existing price: {pricing_entry['code']}")
+                                continue
                             morpheus_api.post("prices", pricing_entry)
                             logger.info(f"Created price: {pricing_entry['name']}")
                             time.sleep(0.05)
@@ -606,6 +611,11 @@ def main():
                 if not args.dry_run and discovered_plans:
                     for price_set in price_sets:
                         try:
+                            # Idempotency: skip if price set already exists
+                            existing = morpheus_api.get(f"price-sets?code={price_set['code']}")
+                            if existing and existing.get('priceSets'):
+                                logger.debug(f"Skipping existing price set: {price_set['code']}")
+                                continue
                             morpheus_api.post("price-sets", price_set)
                             logger.info(f"Created price set: {price_set['name']}")
                             time.sleep(0.05)
@@ -621,6 +631,11 @@ def main():
                 if not args.dry_run:
                     for service_plan in service_plans_payloads:
                         try:
+                            # Idempotency: skip if service plan already exists
+                            existing = morpheus_api.get(f"service-plans?code={service_plan['code']}")
+                            if existing and existing.get('servicePlans'):
+                                logger.debug(f"Skipping existing service plan: {service_plan['code']}")
+                                continue
                             morpheus_api.post("service-plans", service_plan)
                             logger.info(f"Created service plan: {service_plan['name']}")
                             time.sleep(0.05)
