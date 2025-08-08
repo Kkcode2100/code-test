@@ -272,25 +272,40 @@ def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
     """Discover existing plans in Morpheus (filters for GCP)."""
     logger.info("Discovering existing Morpheus service plans...")
     try:
-        # Use the correct endpoint and filter for Google provision type
-        plans_response = morpheus_api.get("service-plans?max=1000&provisionTypeCode=google")
-        plans = plans_response.get("servicePlans", []) if plans_response else []
+        # Query the proper endpoint and scope to Google
+        resp = morpheus_api.get("service-plans?provisionTypeCode=google&max=1000")
+        all_plans = resp.get("servicePlans", []) if resp else []
+
+        # Include patterns for GCP families and legacy types
+        include_patterns = [
+            r'^[a-z]\d+[a-z]?-',   # e2-, n2-, c2-, n2d-, c2d-, etc.
+            r'^(f1|g1)-',           # legacy types
+        ]
+        # Exclude obvious non-GCP/noise
+        exclude_fragments = [
+            'azure', 'rds db.', 'aks ', 'eks ', 'gke controller', 'hyper-v',
+            'default', 'discovered', 'terraform', 'workflow', 'controller',
+            'stack', 'external', 'manual', 'kubernetes', 'dtus', 'ioh vm',
+            ' cpu,', ' memory,', ' storage'
+        ]
+
         gcp_plans = []
-        for plan in plans:
-            provision_type = (plan.get("provisionType") or {})
-            provision_code = (provision_type.get("code") or "").lower()
-            if provision_code == "google":
+        for plan in all_plans:
+            name = (plan.get('name') or '').lower()
+            if any(frag in name for frag in exclude_fragments):
+                continue
+            if any(re.match(pat, name) for pat in include_patterns):
                 gcp_plans.append(plan)
                 continue
-            # Fallback checks in case API shape varies
-            if plan.get("zone", {}).get("cloud", {}).get("type") == "gcp":
+            # Fallback on explicit metadata if present
+            provision_code = ((plan.get('provisionType') or {}).get('code') or '').lower()
+            if provision_code == 'google':
                 gcp_plans.append(plan)
                 continue
-            name = (plan.get("name") or "").lower()
-            if re.match(r'^(?:[a-z]\d+[a-z]?|f1|g1)-', name):
+            if plan.get('zone', {}).get('cloud', {}).get('type') == 'gcp':
                 gcp_plans.append(plan)
-                continue
-        logger.info(f"Found {len(gcp_plans)} GCP service plans (of {len(plans)} total)")
+
+        logger.info(f"Found {len(gcp_plans)} actual GCP Service Plans (excluded {len(all_plans) - len(gcp_plans)} non-GCP plans)")
         return gcp_plans
     except Exception as e:
         logger.error(f"Error discovering plans: {e}")
