@@ -610,10 +610,14 @@ def validate_price_payload(payload: dict) -> bool:
                     logger.error(f"Field '{field}' must be boolean, got: {price[field]}")
                     return False
         
-        # Validate priceType
-        valid_price_types = ['cores', 'memory', 'storage', 'software', 'compute']
+        # Validate priceType (from official Morpheus API documentation)
+        valid_price_types = [
+            'fixed', 'compute', 'memory', 'cores', 'storage', 'datastore', 
+            'platform', 'software', 'load_balancer', 'load_balancer_virtual_server'
+        ]
         if price.get('priceType') not in valid_price_types:
-            logger.warning(f"Potentially invalid priceType: {price.get('priceType')}. Valid types: {valid_price_types}")
+            logger.error(f"Invalid priceType: {price.get('priceType')}. Valid types: {valid_price_types}")
+            return False
         
         return True
     except Exception as e:
