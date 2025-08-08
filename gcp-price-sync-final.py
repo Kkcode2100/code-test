@@ -29,6 +29,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime
+from typing import Union, Optional, Tuple, List, Dict
 
 import requests
 import urllib3
@@ -214,7 +215,7 @@ class SKUCatalogProcessor:
             return 'ai_ml'
         return 'other'
 
-    def extract_machine_family(self, text: str) -> str | None:
+    def extract_machine_family(self, text: str) -> Optional[str]:
         name = (text or '').lower()
         patterns = [r'^([a-z]\d+[a-z]?)-', r'\b([a-z]\d+[a-z]?)-']
         for pat in patterns:
@@ -223,7 +224,7 @@ class SKUCatalogProcessor:
                 return m.group(1)
         return None
 
-    def classify_price_type(self, sku: dict) -> tuple[str, str | None]:
+    def classify_price_type(self, sku: dict) -> Tuple[str, Optional[str]]:
         """Return (priceTypeCode, machine_family) for SKU."""
         service_name = (sku.get('service_name') or '').lower()
         description = (sku.get('description') or '').lower()
@@ -253,7 +254,7 @@ class SKUCatalogProcessor:
 
     def _extract_compute_skus(self):
         """Extract compute SKUs for service plan creation (instance families/types)."""
-        compute_skus: list[dict] = []
+        compute_skus: List[dict] = []
         for service_id, service_data in self.catalog['services'].items():
             if service_data['service_info']['display_name'] == 'Compute Engine':
                 for sku in service_data.get('skus', []):
@@ -454,7 +455,7 @@ def create_service_plans_from_skus(sku_processor: SKUCatalogProcessor):
     if not compute_skus:
         logger.warning("No compute SKUs found for service plan creation")
         return []
-    instance_families: dict[str, list] = defaultdict(list)
+    instance_families: Dict[str, list] = defaultdict(list)
     for sku in compute_skus:
         instance_type = sku['instance_type']
         if instance_type != 'general':
@@ -485,7 +486,7 @@ def create_service_plans_from_skus(sku_processor: SKUCatalogProcessor):
     return service_plans
 
 
-def create_component_price_sets(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor, pricing_data: list[dict]):
+def create_component_price_sets(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor, pricing_data: List[dict]):
     """Create component price sets (cores + memory + storage) per machine family and region, with regionCode."""
     logger.info("Creating component price sets per family and region...")
 
@@ -497,8 +498,8 @@ def create_component_price_sets(morpheus_api: MorpheusApiClient, sku_processor: 
     price_id_map = {p['code']: p['id'] for p in all_prices_resp['prices']}
 
     # Group storage prices by region; cores/memory by (family, region)
-    storage_prices_by_region: dict[str, set[int]] = defaultdict(set)
-    family_prices: dict[tuple[str, str], dict] = {}
+    storage_prices_by_region: Dict[str, set] = defaultdict(set)
+    family_prices: Dict[Tuple[str, str], dict] = {}
 
     region = sku_processor.metadata_region
     region_key = region.replace('-', '_')
@@ -681,10 +682,10 @@ def validate_sync(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProc
         return None
 
 
-def _print_plans_summary(plans: list[dict]):
+def _print_plans_summary(plans: List[dict]):
     """Print grouped summary of GCP plans by machine family with examples."""
     from collections import defaultdict
-    family_groups: dict[str, list[str]] = defaultdict(list)
+    family_groups: Dict[str, List[str]] = defaultdict(list)
     for p in plans:
         name = (p.get('name') or '').lower()
         family = 'unknown'
