@@ -527,6 +527,9 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Run in dry-run mode (no changes made)')
     parser.add_argument('--create-service-plans', action='store_true', help='Create service plans from compute SKUs')
     parser.add_argument('--validate-only', action='store_true', help='Only validate existing sync results')
+    parser.add_argument('--create-prices', action='store_true', help='Create prices from SKU catalog')
+    parser.add_argument('--create-price-sets', action='store_true', help='Create price sets from SKU catalog summary')
+    parser.add_argument('--map-to-plans', action='store_true', help='Map created price sets to discovered GCP service plans')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     args = parser.parse_args()
 
@@ -536,6 +539,16 @@ def main():
     try:
         morpheus_api = MorpheusApiClient(MORPHEUS_URL, MORPHEUS_TOKEN)
         sku_processor = SKUCatalogProcessor(args.sku_catalog)
+
+        # Discover existing GCP service plans up front (to scope actions)
+        discovered_plans = discover_morpheus_plans(morpheus_api)
+        if not discovered_plans:
+            logger.warning("No GCP service plans discovered in Morpheus. Creation steps will be skipped.")
+            if args.validate_only:
+                pass
+            else:
+                print("\nNo GCP service plans found. Use Morpheus to create or import plans, then re-run.")
+                # Still allow dry-run preview of counts
 
         print("\n=== GCP SKU Catalog Information ===")
         metadata = sku_processor.catalog.get('metadata', {})
@@ -564,12 +577,82 @@ def main():
                 print(f"Coverage: {results['coverage_percentage']:.1f}%")
         else:
             print("\n=== Starting Sync ===")
-            sync_results = sync_data(morpheus_api, sku_processor, args.dry_run, args.create_service_plans)
+
+            # Decide what to create based on flags; default is to create both if neither is specified
+            create_prices_flag = args.create_prices or (not args.create_prices and not args.create_price_sets)
+            create_price_sets_flag = args.create_price_sets or (not args.create_prices and not args.create_price_sets)
+
+            pricing_data = []
+            price_sets = []
+            service_plans_payloads = []
+
+            if create_prices_flag:
+                pricing_data = create_comprehensive_pricing_data(sku_processor)
+                if not args.dry_run and discovered_plans:
+                    for pricing_entry in pricing_data:
+                        try:
+                            morpheus_api.post("prices", pricing_entry)
+                            logger.info(f"Created price: {pricing_entry['name']}")
+                            time.sleep(0.05)
+                        except Exception as e:
+                            logger.error(f"Error creating price {pricing_entry['name']}: {e}")
+                elif args.dry_run:
+                    logger.info(f"DRY RUN: Would create {len(pricing_data)} prices")
+                else:
+                    logger.warning("Skipping price creation as no GCP plans were discovered")
+
+            if create_price_sets_flag:
+                price_sets = create_enhanced_price_sets(sku_processor)
+                if not args.dry_run and discovered_plans:
+                    for price_set in price_sets:
+                        try:
+                            morpheus_api.post("price-sets", price_set)
+                            logger.info(f"Created price set: {price_set['name']}")
+                            time.sleep(0.05)
+                        except Exception as e:
+                            logger.error(f"Error creating price set {price_set['name']}: {e}")
+                elif args.dry_run:
+                    logger.info(f"DRY RUN: Would create {len(price_sets)} price sets")
+                else:
+                    logger.warning("Skipping price set creation as no GCP plans were discovered")
+
+            if args.create_service_plans:
+                service_plans_payloads = create_service_plans_from_skus(sku_processor)
+                if not args.dry_run:
+                    for service_plan in service_plans_payloads:
+                        try:
+                            morpheus_api.post("service-plans", service_plan)
+                            logger.info(f"Created service plan: {service_plan['name']}")
+                            time.sleep(0.05)
+                        except Exception as e:
+                            logger.error(f"Error creating service plan {service_plan['name']}: {e}")
+                else:
+                    logger.info(f"DRY RUN: Would create {len(service_plans_payloads)} service plans")
+
+            # Optionally map created price sets to discovered plans
+            if args.map_to_plans and not args.dry_run and discovered_plans:
+                try:
+                    # Refresh to get IDs
+                    ps_resp = morpheus_api.get(f"price-sets?max=1000&phrase={PRICE_PREFIX}")
+                    price_sets_list = ps_resp.get('priceSets', []) if ps_resp else []
+                    price_set_ids = [ps['id'] for ps in price_sets_list]
+                    updated = 0
+                    for plan in discovered_plans:
+                        current_ids = {ps['id'] for ps in (plan.get('priceSets') or []) if ps and 'id' in ps}
+                        final_ids = current_ids.union(price_set_ids)
+                        payload = {"servicePlan": {"priceSets": [{"id": pid} for pid in final_ids]}}
+                        resp = morpheus_api.put(f"service-plans/{plan['id']}", payload)
+                        if resp and (resp.get('success') or resp.get('servicePlan')):
+                            updated += 1
+                    logger.info(f"Mapped price sets to {updated}/{len(discovered_plans)} plans")
+                except Exception as e:
+                    logger.error(f"Failed to map price sets to plans: {e}")
+
             validation_results = validate_sync(morpheus_api, sku_processor)
 
             print("\n=== Final Sync Summary ===")
-            print(f"SKU Categories Processed: {list(sync_results['sku_summary'].keys())}")
-            for category, summary in sync_results['sku_summary'].items():
+            print(f"SKU Categories Processed: {list(processed_summary.keys())}")
+            for category, summary in processed_summary.items():
                 print(f"  {category}: {summary['count']} SKUs")
             if validation_results:
                 print(f"\nCoverage Achieved: {validation_results['coverage_percentage']:.1f}%")
