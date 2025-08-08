@@ -270,18 +270,27 @@ class SKUCatalogProcessor:
 
 def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
     """Discover existing plans in Morpheus (filters for GCP)."""
-    logger.info("Discovering existing Morpheus plans...")
+    logger.info("Discovering existing Morpheus service plans...")
     try:
-        plans_response = morpheus_api.get("plans")
-        if not plans_response:
-            logger.warning("No plans found or unable to fetch plans")
-            return []
-        plans = plans_response.get("plans", [])
+        # Use the correct endpoint and filter for Google provision type
+        plans_response = morpheus_api.get("service-plans?max=1000&provisionTypeCode=google")
+        plans = plans_response.get("servicePlans", []) if plans_response else []
         gcp_plans = []
         for plan in plans:
+            provision_type = (plan.get("provisionType") or {})
+            provision_code = (provision_type.get("code") or "").lower()
+            if provision_code == "google":
+                gcp_plans.append(plan)
+                continue
+            # Fallback checks in case API shape varies
             if plan.get("zone", {}).get("cloud", {}).get("type") == "gcp":
                 gcp_plans.append(plan)
-        logger.info(f"Found {len(gcp_plans)} GCP plans (of {len(plans)} total)")
+                continue
+            name = (plan.get("name") or "").lower()
+            if re.match(r'^(?:[a-z]\d+[a-z]?|f1|g1)-', name):
+                gcp_plans.append(plan)
+                continue
+        logger.info(f"Found {len(gcp_plans)} GCP service plans (of {len(plans)} total)")
         return gcp_plans
     except Exception as e:
         logger.error(f"Error discovering plans: {e}")
@@ -543,13 +552,10 @@ def main():
         # Discover existing GCP service plans up front (to scope actions)
         discovered_plans = discover_morpheus_plans(morpheus_api)
         if not discovered_plans:
-            logger.warning("No GCP service plans discovered in Morpheus. Creation steps will be skipped.")
-            if args.validate_only:
-                pass
-            else:
-                print("\nNo GCP service plans found. Use Morpheus to create or import plans, then re-run.")
-                # Still allow dry-run preview of counts
-
+            logger.warning("No GCP service plans discovered in Morpheus.")
+            if not args.validate_only:
+                print("\nNo GCP service plans found. Prices and price sets will still be created; mapping to plans will be skipped. You can create plans in Morpheus or run again with --create-service-plans.")
+            
         print("\n=== GCP SKU Catalog Information ===")
         metadata = sku_processor.catalog.get('metadata', {})
         print(f"Region: {metadata.get('region')}")
@@ -588,7 +594,7 @@ def main():
 
             if create_prices_flag:
                 pricing_data = create_comprehensive_pricing_data(sku_processor)
-                if not args.dry_run and discovered_plans:
+                if not args.dry_run:
                     for pricing_entry in pricing_data:
                         try:
                             # Idempotency: skip if price already exists
@@ -603,12 +609,10 @@ def main():
                             logger.error(f"Error creating price {pricing_entry['name']}: {e}")
                 elif args.dry_run:
                     logger.info(f"DRY RUN: Would create {len(pricing_data)} prices")
-                else:
-                    logger.warning("Skipping price creation as no GCP plans were discovered")
 
             if create_price_sets_flag:
                 price_sets = create_enhanced_price_sets(sku_processor)
-                if not args.dry_run and discovered_plans:
+                if not args.dry_run:
                     for price_set in price_sets:
                         try:
                             # Idempotency: skip if price set already exists
@@ -623,8 +627,6 @@ def main():
                             logger.error(f"Error creating price set {price_set['name']}: {e}")
                 elif args.dry_run:
                     logger.info(f"DRY RUN: Would create {len(price_sets)} price sets")
-                else:
-                    logger.warning("Skipping price set creation as no GCP plans were discovered")
 
             if args.create_service_plans:
                 service_plans_payloads = create_service_plans_from_skus(sku_processor)
