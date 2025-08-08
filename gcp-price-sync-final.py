@@ -83,6 +83,9 @@ class MorpheusApiClient:
                 try:
                     error_detail = e.response.json()
                     logger.error(f"Error details: {json.dumps(error_detail, indent=2)}")
+                    # If this is a price creation error, log additional context
+                    if endpoint == "prices" and method.upper() == "POST":
+                        logger.error(f"Price creation failed with payload type. This might be due to missing required fields or incorrect priceType value.")
                 except Exception:
                     logger.error(f"Raw error response: {e.response.text}")
                 raise
@@ -575,6 +578,41 @@ def create_component_price_sets(morpheus_api: MorpheusApiClient, sku_processor: 
     return created_or_updated
 
 
+def validate_price_payload(payload: dict) -> bool:
+    """Validate that a price payload has all required fields and correct data types."""
+    try:
+        price = payload.get('price', {})
+        required_fields = ['name', 'code', 'priceType', 'priceUnit', 'price', 'cost', 'currency']
+        
+        for field in required_fields:
+            if field not in price:
+                logger.error(f"Missing required field '{field}' in price payload")
+                return False
+            if price[field] is None and field in ['name', 'code', 'priceType', 'priceUnit', 'currency']:
+                logger.error(f"Required field '{field}' cannot be None")
+                return False
+        
+        # Validate numeric fields
+        numeric_fields = ['price', 'cost', 'markup']
+        for field in numeric_fields:
+            if field in price and price[field] is not None:
+                try:
+                    float(price[field])
+                except (ValueError, TypeError):
+                    logger.error(f"Field '{field}' must be numeric, got: {price[field]}")
+                    return False
+        
+        # Validate priceType
+        valid_price_types = ['cores', 'memory', 'storage', 'software', 'compute']
+        if price.get('priceType') not in valid_price_types:
+            logger.warning(f"Potentially invalid priceType: {price.get('priceType')}. Valid types: {valid_price_types}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error validating price payload: {e}")
+        return False
+
+
 def sync_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor,
               dry_run: bool = False, create_service_plans: bool = False):
     """Sync prices and price sets (and optionally service plans) into Morpheus."""
@@ -604,13 +642,29 @@ def sync_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcesso
                     'incurCharges': pricing_entry['incurCharges'],
                     'currency': pricing_entry['currency'],
                     'active': pricing_entry['active'],
+                    'account': None,
+                    'volumeType': None,
+                    'datastore': None,
+                    'crossCloudApply': False,
+                    'markup': 0.0,
+                    'markupType': 'fixed'
                 }}
+                
+                # Validate payload before sending
+                if not validate_price_payload(payload):
+                    logger.error(f"Skipping invalid price payload for: {pricing_entry['name']}")
+                    continue
+                    
                 response = morpheus_api.post("prices", payload)
                 if response:
                     created_prices.append(response)
+                    logger.info(f"Successfully created price: {pricing_entry['name']}")
+                else:
+                    logger.error(f"Failed to create price {pricing_entry['name']}: No response from API")
                 time.sleep(0.02)
             except Exception as e:
                 logger.error(f"Error creating price {pricing_entry['name']}: {e}")
+                logger.debug(f"Failed payload: {json.dumps(payload, indent=2)}")
         # Create component price sets (needs current Morpheus price IDs)
         try:
             created_set_codes = create_component_price_sets(morpheus_api, sku_processor, pricing_data)
@@ -803,12 +857,28 @@ def main():
                                 'incurCharges': pricing_entry['incurCharges'],
                                 'currency': pricing_entry['currency'],
                                 'active': pricing_entry['active'],
+                                'account': None,
+                                'volumeType': None,
+                                'datastore': None,
+                                'crossCloudApply': False,
+                                'markup': 0.0,
+                                'markupType': 'fixed'
                             }}
-                            morpheus_api.post("prices", payload)
-                            logger.info(f"Created price: {pricing_entry['name']}")
+                            
+                            # Validate payload before sending
+                            if not validate_price_payload(payload):
+                                logger.error(f"Skipping invalid price payload for: {pricing_entry['name']}")
+                                continue
+                                
+                            response = morpheus_api.post("prices", payload)
+                            if response:
+                                logger.info(f"Successfully created price: {pricing_entry['name']}")
+                            else:
+                                logger.error(f"Failed to create price {pricing_entry['name']}: No response from API")
                             time.sleep(0.02)
                         except Exception as e:
                             logger.error(f"Error creating price {pricing_entry['name']}: {e}")
+                            logger.debug(f"Failed payload: {json.dumps(payload, indent=2)}")
                 else:
                     logger.info(f"DRY RUN: Would create {len(pricing_data)} prices")
 
