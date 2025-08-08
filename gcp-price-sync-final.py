@@ -593,13 +593,21 @@ def validate_price_payload(payload: dict) -> bool:
                 return False
         
         # Validate numeric fields
-        numeric_fields = ['price', 'cost', 'markup']
+        numeric_fields = ['price', 'cost']
         for field in numeric_fields:
             if field in price and price[field] is not None:
                 try:
                     float(price[field])
                 except (ValueError, TypeError):
                     logger.error(f"Field '{field}' must be numeric, got: {price[field]}")
+                    return False
+        
+        # Validate boolean fields
+        boolean_fields = ['incurCharges', 'active']
+        for field in boolean_fields:
+            if field in price and price[field] is not None:
+                if not isinstance(price[field], bool):
+                    logger.error(f"Field '{field}' must be boolean, got: {price[field]}")
                     return False
         
         # Validate priceType
@@ -637,17 +645,11 @@ def sync_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcesso
                     'code': pricing_entry['morpheus_code'],
                     'priceType': pricing_entry['priceTypeCode'],
                     'priceUnit': pricing_entry['priceUnit'],
-                    'price': pricing_entry['price'],
-                    'cost': pricing_entry['cost'],
-                    'incurCharges': pricing_entry['incurCharges'],
+                    'price': float(pricing_entry['price']),
+                    'cost': float(pricing_entry['cost']),
+                    'incurCharges': bool(pricing_entry['incurCharges']),
                     'currency': pricing_entry['currency'],
-                    'active': pricing_entry['active'],
-                    'account': None,
-                    'volumeType': None,
-                    'datastore': None,
-                    'crossCloudApply': False,
-                    'markup': 0.0,
-                    'markupType': 'fixed'
+                    'active': bool(pricing_entry['active'])
                 }}
                 
                 # Validate payload before sending
@@ -852,17 +854,11 @@ def main():
                                 'code': pricing_entry['morpheus_code'],
                                 'priceType': pricing_entry['priceTypeCode'],
                                 'priceUnit': pricing_entry['priceUnit'],
-                                'price': pricing_entry['price'],
-                                'cost': pricing_entry['cost'],
-                                'incurCharges': pricing_entry['incurCharges'],
+                                'price': float(pricing_entry['price']),
+                                'cost': float(pricing_entry['cost']),
+                                'incurCharges': bool(pricing_entry['incurCharges']),
                                 'currency': pricing_entry['currency'],
-                                'active': pricing_entry['active'],
-                                'account': None,
-                                'volumeType': None,
-                                'datastore': None,
-                                'crossCloudApply': False,
-                                'markup': 0.0,
-                                'markupType': 'fixed'
+                                'active': bool(pricing_entry['active'])
                             }}
                             
                             # Validate payload before sending
