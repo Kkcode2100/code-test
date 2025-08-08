@@ -106,6 +106,7 @@ class SKUCatalogProcessor:
     def __init__(self, catalog_file: str):
         self.catalog_file = catalog_file
         self.catalog = self._load_catalog()
+        self.metadata_region = (self.catalog.get('metadata') or {}).get('region') or GCP_REGION
         self.processed_skus = self._process_skus()
         self.compute_skus = self._extract_compute_skus()
 
@@ -176,6 +177,7 @@ class SKUCatalogProcessor:
             return None
 
     def _categorize_sku(self, sku: dict) -> str:
+        # unchanged categorization for summary reporting
         service_name = sku['service_name'].lower()
         description = sku['description'].lower()
         category = sku['category']
@@ -211,6 +213,43 @@ class SKUCatalogProcessor:
         if any(k in description for k in ['ai', 'ml', 'machine learning', 'tensorflow']):
             return 'ai_ml'
         return 'other'
+
+    def extract_machine_family(self, text: str) -> str | None:
+        name = (text or '').lower()
+        patterns = [r'^([a-z]\d+[a-z]?)-', r'\b([a-z]\d+[a-z]?)-']
+        for pat in patterns:
+            m = re.search(pat, name)
+            if m:
+                return m.group(1)
+        return None
+
+    def classify_price_type(self, sku: dict) -> tuple[str, str | None]:
+        """Return (priceTypeCode, machine_family) for SKU."""
+        service_name = (sku.get('service_name') or '').lower()
+        description = (sku.get('description') or '').lower()
+        category = sku.get('category') or {}
+        resource_family = (category.get('resourceFamily') or '').lower()
+        resource_group = (category.get('resourceGroup') or '').lower()
+
+        # Storage
+        storage_keywords = ['persistent disk', 'pd-', 'hyperdisk', 'local ssd', 'ssd', 'hdd', 'filestore']
+        if resource_family == 'storage' or any(k in description for k in storage_keywords):
+            return 'storage', None
+
+        # Compute cores
+        core_keywords = ['vcpu', 'core', 'cpu']
+        if resource_family == 'compute' or resource_group == 'cpu' or any(k in description for k in core_keywords):
+            fam = self.extract_machine_family(description)
+            return 'cores', fam
+
+        # Memory
+        mem_keywords = ['ram', 'memory']
+        if resource_group == 'ram' or any(k in description for k in mem_keywords):
+            fam = self.extract_machine_family(description)
+            return 'memory', fam
+
+        # Default
+        return 'software', None
 
     def _extract_compute_skus(self):
         """Extract compute SKUs for service plan creation (instance families/types)."""
@@ -270,18 +309,42 @@ class SKUCatalogProcessor:
 
 def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
     """Discover existing plans in Morpheus (filters for GCP)."""
-    logger.info("Discovering existing Morpheus plans...")
+    logger.info("Discovering existing Morpheus service plans...")
     try:
-        plans_response = morpheus_api.get("plans")
-        if not plans_response:
-            logger.warning("No plans found or unable to fetch plans")
-            return []
-        plans = plans_response.get("plans", [])
+        # Query the proper endpoint and scope to Google
+        resp = morpheus_api.get("service-plans?provisionTypeCode=google&max=1000")
+        all_plans = resp.get("servicePlans", []) if resp else []
+
+        # Include patterns for GCP families and legacy types
+        include_patterns = [
+            r'^[a-z]\d+[a-z]?-',   # e2-, n2-, c2-, n2d-, c2d-, etc.
+            r'^(f1|g1)-',           # legacy types
+        ]
+        # Exclude obvious non-GCP/noise
+        exclude_fragments = [
+            'azure', 'rds db.', 'aks ', 'eks ', 'gke controller', 'hyper-v',
+            'default', 'discovered', 'terraform', 'workflow', 'controller',
+            'stack', 'external', 'manual', 'kubernetes', 'dtus', 'ioh vm',
+            ' cpu,', ' memory,', ' storage'
+        ]
+
         gcp_plans = []
-        for plan in plans:
-            if plan.get("zone", {}).get("cloud", {}).get("type") == "gcp":
+        for plan in all_plans:
+            name = (plan.get('name') or '').lower()
+            if any(frag in name for frag in exclude_fragments):
+                continue
+            if any(re.match(pat, name) for pat in include_patterns):
                 gcp_plans.append(plan)
-        logger.info(f"Found {len(gcp_plans)} GCP plans (of {len(plans)} total)")
+                continue
+            # Fallback on explicit metadata if present
+            provision_code = ((plan.get('provisionType') or {}).get('code') or '').lower()
+            if provision_code == 'google':
+                gcp_plans.append(plan)
+                continue
+            if plan.get('zone', {}).get('cloud', {}).get('type') == 'gcp':
+                gcp_plans.append(plan)
+
+        logger.info(f"Found {len(gcp_plans)} actual GCP Service Plans (excluded {len(all_plans) - len(gcp_plans)} non-GCP plans)")
         return gcp_plans
     except Exception as e:
         logger.error(f"Error discovering plans: {e}")
@@ -289,42 +352,48 @@ def discover_morpheus_plans(morpheus_api: MorpheusApiClient):
 
 
 def create_comprehensive_pricing_data(sku_processor: SKUCatalogProcessor):
-    """Create comprehensive pricing entries from SKU catalog."""
+    """Create comprehensive pricing entries from SKU catalog, with type/family/region tags."""
     logger.info("Creating comprehensive pricing data from SKU catalog...")
     all_skus = sku_processor.get_all_skus()
     logger.info(f"Processing {len(all_skus)} SKUs for pricing data creation")
     pricing_data = []
+    region = sku_processor.metadata_region
+    region_key = region.replace('-', '_')
     for sku in all_skus:
         try:
-            pricing_entry = {
-                'name': f"{PRICE_PREFIX}-{sku['sku_id']}",
-                'code': f"gcp-{sku['sku_id']}",
-                'priceType': 'fixed',
-                'priceUnit': sku['pricing_unit'],
-                'price': 0.0,
-                'markupType': 'fixed',
-                'markup': 0,
-                'markupPercent': 0,
-                'cost': 0.0,
-                'currency': 'USD',
-                'refType': 'ComputeZone',
-                'refId': None,
-                'volumeType': None,
-                'datastore': None,
-                'crossCloudApply': False,
-                'sku': sku['sku_id'],
-                'sku_description': sku['description'],
-                'service_name': sku['service_name'],
-                'service_id': sku['service_id'],
-                'category': sku['category'],
-            }
+            price_type, machine_family = sku_processor.classify_price_type(sku)
             rate = sku['rate']
+            price_value = 0.0
             if 'units' in rate and 'nanos' in rate:
                 units_val = int(rate.get('units') or 0)
                 nanos_val = int(rate.get('nanos') or 0)
-                price = units_val + nanos_val / 1_000_000_000
-                pricing_entry['price'] = price
-                pricing_entry['cost'] = price
+                price_value = units_val + nanos_val / 1_000_000_000
+
+            # Build a stable code; include region, type, and family if applicable
+            base_code_parts = [PRICE_PREFIX.lower(), 'gcp', price_type]
+            if machine_family:
+                base_code_parts.append(machine_family)
+            base_code_parts.append(region_key)
+            base_code_parts.append(sku['sku_id'])
+            morpheus_code = '.'.join(base_code_parts)
+
+            pricing_entry = {
+                'name': f"{PRICE_PREFIX} - {sku['description']}",
+                'morpheus_code': morpheus_code,
+                'priceTypeCode': price_type,
+                'priceUnit': 'hour',
+                'price': price_value,
+                'cost': price_value,
+                'currency': 'USD',
+                'incurCharges': True,
+                'active': True,
+                'region': region,
+                'machine_family': machine_family or 'software' if price_type == 'software' else (machine_family or 'unknown'),
+                'sku_id': sku['sku_id'],
+                'service_name': sku['service_name'],
+                'category': sku['category'],
+                'description': sku['description'],
+            }
             pricing_data.append(pricing_entry)
         except Exception as e:
             logger.warning(f"Error processing SKU {sku.get('sku_id', 'unknown')} for pricing: {e}")
@@ -416,6 +485,95 @@ def create_service_plans_from_skus(sku_processor: SKUCatalogProcessor):
     return service_plans
 
 
+def create_component_price_sets(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor, pricing_data: list[dict]):
+    """Create component price sets (cores + memory + storage) per machine family and region, with regionCode."""
+    logger.info("Creating component price sets per family and region...")
+
+    # Fetch all prices to map code -> id
+    all_prices_resp = morpheus_api.get(f"prices?max=5000&phrase={PRICE_PREFIX}")
+    if not all_prices_resp or not all_prices_resp.get('prices'):
+        logger.error("No prices found with the required prefix. Please run with --create-prices first.")
+        return []
+    price_id_map = {p['code']: p['id'] for p in all_prices_resp['prices']}
+
+    # Group storage prices by region; cores/memory by (family, region)
+    storage_prices_by_region: dict[str, set[int]] = defaultdict(set)
+    family_prices: dict[tuple[str, str], dict] = {}
+
+    region = sku_processor.metadata_region
+    region_key = region.replace('-', '_')
+
+    storage_types = ['pd-standard', 'pd-ssd', 'pd-balanced', 'pd-extreme', 'local-ssd',
+                     'hyperdisk-balanced', 'hyperdisk-extreme', 'regional-pd-standard', 'regional-pd-ssd']
+
+    for p in pricing_data:
+        code = p['morpheus_code']
+        price_id = price_id_map.get(code)
+        if not price_id:
+            continue
+        if p['priceTypeCode'] == 'storage' or any(t in p['description'].lower() for t in storage_types):
+            storage_prices_by_region[region_key].add(price_id)
+        elif p['priceTypeCode'] in ('cores', 'memory') and p.get('machine_family') and p['machine_family'] not in ('software', 'unknown'):
+            key = (p['machine_family'], region_key)
+            if key not in family_prices:
+                family_prices[key] = {
+                    'name': f"{PRICE_PREFIX} - GCP - {p['machine_family'].upper()} ({region})",
+                    'code': f"{PRICE_PREFIX.lower()}.gcp-{p['machine_family']}-{region_key}",
+                    'prices': set(),
+                    'price_types': set(),
+                    'region': region,
+                    'region_key': region_key,
+                }
+            family_prices[key]['prices'].add(price_id)
+            family_prices[key]['price_types'].add(p['priceTypeCode'])
+
+    # Attach storage to each family set
+    for key, data in family_prices.items():
+        rk = data['region_key']
+        if rk in storage_prices_by_region:
+            data['prices'].update(storage_prices_by_region[rk])
+            data['price_types'].add('storage')
+
+    # Create or update price sets
+    created_or_updated = []
+    for (_fam, _rk), data in family_prices.items():
+        if not data['prices']:
+            logger.warning(f"Skipping price set '{data['name']}' - no prices found")
+            continue
+        # Validate required components
+        required = {'cores', 'memory', 'storage'}
+        if not required.issubset(data['price_types']):
+            logger.warning(f"Missing required components for '{data['name']}': {required - data['price_types']}")
+            # still proceed if cores+memory exist; storage may be added later
+
+        payload = {
+            'priceSet': {
+                'name': data['name'],
+                'code': data['code'],
+                'type': 'component',
+                'priceUnit': 'hour',
+                'regionCode': data['region'],  # ensure actual region
+                'prices': [{'id': pid} for pid in sorted(data['prices'])],
+            }
+        }
+        try:
+            existing = morpheus_api.get(f"price-sets?code={data['code']}")
+            if existing and existing.get('priceSets'):
+                ps_id = existing['priceSets'][0]['id']
+                resp = morpheus_api.put(f"price-sets/{ps_id}", payload)
+            else:
+                resp = morpheus_api.post("price-sets", payload)
+            if resp and (resp.get('success') or resp.get('priceSet')):
+                created_or_updated.append(data['code'])
+                logger.info(f"Processed price set: {data['name']}")
+            else:
+                logger.error(f"Failed to process price set '{data['name']}': {resp}")
+        except Exception as e:
+            logger.error(f"Error creating/updating price set '{data['name']}': {e}")
+    logger.info(f"Created/updated {len(created_or_updated)} component price sets")
+    return created_or_updated
+
+
 def sync_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcessor,
               dry_run: bool = False, create_service_plans: bool = False):
     """Sync prices and price sets (and optionally service plans) into Morpheus."""
@@ -423,29 +581,42 @@ def sync_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcesso
     if dry_run:
         logger.info("DRY RUN MODE - No changes will be made")
     pricing_data = create_comprehensive_pricing_data(sku_processor)
-    price_sets = create_enhanced_price_sets(sku_processor)
+    # replace old set creator with component sets signature (needs API)
+    # price_sets here will hold codes of created sets
+    price_sets = []
     service_plans = create_service_plans_from_skus(sku_processor) if create_service_plans else []
     if not dry_run:
         created_prices = []
         for pricing_entry in pricing_data:
             try:
-                response = morpheus_api.post("prices", pricing_entry)
+                # Idempotency: skip if exists
+                existing = morpheus_api.get(f"prices?code={pricing_entry['morpheus_code']}")
+                if existing and existing.get('prices'):
+                    continue
+                payload = { 'price': {
+                    'name': pricing_entry['name'],
+                    'code': pricing_entry['morpheus_code'],
+                    'priceType': pricing_entry['priceTypeCode'],
+                    'priceUnit': pricing_entry['priceUnit'],
+                    'price': pricing_entry['price'],
+                    'cost': pricing_entry['cost'],
+                    'incurCharges': pricing_entry['incurCharges'],
+                    'currency': pricing_entry['currency'],
+                    'active': pricing_entry['active'],
+                }}
+                response = morpheus_api.post("prices", payload)
                 if response:
                     created_prices.append(response)
-                    logger.info(f"Created price: {pricing_entry['name']}")
-                time.sleep(0.05)
+                time.sleep(0.02)
             except Exception as e:
                 logger.error(f"Error creating price {pricing_entry['name']}: {e}")
-        created_price_sets = []
-        for price_set in price_sets:
-            try:
-                response = morpheus_api.post("price-sets", price_set)
-                if response:
-                    created_price_sets.append(response)
-                    logger.info(f"Created price set: {price_set['name']}")
-                time.sleep(0.05)
-            except Exception as e:
-                logger.error(f"Error creating price set {price_set['name']}: {e}")
+        # Create component price sets (needs current Morpheus price IDs)
+        try:
+            created_set_codes = create_component_price_sets(morpheus_api, sku_processor, pricing_data)
+            price_sets = created_set_codes
+        except Exception as e:
+            logger.error(f"Failed creating component price sets: {e}")
+        # Service plans optional (unchanged)
         created_service_plans = []
         if create_service_plans:
             for service_plan in service_plans:
@@ -453,17 +624,16 @@ def sync_data(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProcesso
                     response = morpheus_api.post("service-plans", service_plan)
                     if response:
                         created_service_plans.append(response)
-                        logger.info(f"Created service plan: {service_plan['name']}")
-                    time.sleep(0.05)
+                    time.sleep(0.02)
                 except Exception as e:
                     logger.error(f"Error creating service plan {service_plan['name']}: {e}")
         logger.info(
-            f"Sync completed: {len(created_prices)} prices, {len(created_price_sets)} price sets, "
+            f"Sync completed: {len(created_prices)} prices, {len(price_sets)} price sets, "
             f"{len(created_service_plans)} service plans created"
         )
     else:
         logger.info(
-            f"DRY RUN: Would create {len(pricing_data)} prices, {len(price_sets)} price sets, "
+            f"DRY RUN: Would create {len(pricing_data)} prices, component price sets per family/region, "
             f"{len(service_plans)} service plans"
         )
     return {
@@ -511,6 +681,29 @@ def validate_sync(morpheus_api: MorpheusApiClient, sku_processor: SKUCatalogProc
         return None
 
 
+def _print_plans_summary(plans: list[dict]):
+    """Print grouped summary of GCP plans by machine family with examples."""
+    from collections import defaultdict
+    family_groups: dict[str, list[str]] = defaultdict(list)
+    for p in plans:
+        name = (p.get('name') or '').lower()
+        family = 'unknown'
+        for pattern in [r'^([a-z]\d+[a-z]?)-', r'^(f1|g1)-']:
+            m = re.match(pattern, name)
+            if m:
+                family = m.group(1)
+                break
+        family_groups[family].append(p.get('name') or '')
+    logger.info(f"Found {len(plans)} actual GCP Service Plans (grouped by family):")
+    for family in sorted(family_groups.keys()):
+        items = sorted(family_groups[family])
+        logger.info(f"  {family.upper()} family: {len(items)} plans")
+        for example in items[:3]:
+            print(f"   - {example}")
+        if len(items) > 3:
+            print(f"   - ... and {len(items) - 3} more {family} plans")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Final unified GCP price sync using downloaded SKU catalog",
@@ -531,6 +724,7 @@ def main():
     parser.add_argument('--create-price-sets', action='store_true', help='Create price sets from SKU catalog summary')
     parser.add_argument('--map-to-plans', action='store_true', help='Map created price sets to discovered GCP service plans')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--discover-morpheus-plans', action='store_true', help='Discover and print GCP service plans, then exit')
     args = parser.parse_args()
 
     if args.verbose:
@@ -540,16 +734,19 @@ def main():
         morpheus_api = MorpheusApiClient(MORPHEUS_URL, MORPHEUS_TOKEN)
         sku_processor = SKUCatalogProcessor(args.sku_catalog)
 
-        # Discover existing GCP service plans up front (to scope actions)
+        # Discover existing GCP service plans
         discovered_plans = discover_morpheus_plans(morpheus_api)
-        if not discovered_plans:
-            logger.warning("No GCP service plans discovered in Morpheus. Creation steps will be skipped.")
-            if args.validate_only:
-                pass
-            else:
-                print("\nNo GCP service plans found. Use Morpheus to create or import plans, then re-run.")
-                # Still allow dry-run preview of counts
 
+        if args.discover_morpheus_plans:
+            # Print grouped summary and exit
+            _print_plans_summary(discovered_plans)
+            logger.info("Discovery-only run complete.")
+            return
+        if not discovered_plans:
+            logger.warning("No GCP service plans discovered in Morpheus.")
+            if not args.validate_only:
+                print("\nNo GCP service plans found. Prices and price sets will still be created; mapping to plans will be skipped. You can create plans in Morpheus or run again with --create-service-plans.")
+            
         print("\n=== GCP SKU Catalog Information ===")
         metadata = sku_processor.catalog.get('metadata', {})
         print(f"Region: {metadata.get('region')}")
@@ -588,61 +785,42 @@ def main():
 
             if create_prices_flag:
                 pricing_data = create_comprehensive_pricing_data(sku_processor)
-                if not args.dry_run and discovered_plans:
+                if not args.dry_run:
                     for pricing_entry in pricing_data:
                         try:
-                            # Idempotency: skip if price already exists
-                            existing = morpheus_api.get(f"prices?code={pricing_entry['code']}")
+                            existing = morpheus_api.get(f"prices?code={pricing_entry['morpheus_code']}")
                             if existing and existing.get('prices'):
-                                logger.debug(f"Skipping existing price: {pricing_entry['code']}")
+                                logger.debug(f"Skipping existing price: {pricing_entry['morpheus_code']}")
                                 continue
-                            morpheus_api.post("prices", pricing_entry)
+                            payload = { 'price': {
+                                'name': pricing_entry['name'],
+                                'code': pricing_entry['morpheus_code'],
+                                'priceType': pricing_entry['priceTypeCode'],
+                                'priceUnit': pricing_entry['priceUnit'],
+                                'price': pricing_entry['price'],
+                                'cost': pricing_entry['cost'],
+                                'incurCharges': pricing_entry['incurCharges'],
+                                'currency': pricing_entry['currency'],
+                                'active': pricing_entry['active'],
+                            }}
+                            morpheus_api.post("prices", payload)
                             logger.info(f"Created price: {pricing_entry['name']}")
-                            time.sleep(0.05)
+                            time.sleep(0.02)
                         except Exception as e:
                             logger.error(f"Error creating price {pricing_entry['name']}: {e}")
-                elif args.dry_run:
-                    logger.info(f"DRY RUN: Would create {len(pricing_data)} prices")
                 else:
-                    logger.warning("Skipping price creation as no GCP plans were discovered")
+                    logger.info(f"DRY RUN: Would create {len(pricing_data)} prices")
 
             if create_price_sets_flag:
-                price_sets = create_enhanced_price_sets(sku_processor)
-                if not args.dry_run and discovered_plans:
-                    for price_set in price_sets:
-                        try:
-                            # Idempotency: skip if price set already exists
-                            existing = morpheus_api.get(f"price-sets?code={price_set['code']}")
-                            if existing and existing.get('priceSets'):
-                                logger.debug(f"Skipping existing price set: {price_set['code']}")
-                                continue
-                            morpheus_api.post("price-sets", price_set)
-                            logger.info(f"Created price set: {price_set['name']}")
-                            time.sleep(0.05)
-                        except Exception as e:
-                            logger.error(f"Error creating price set {price_set['name']}: {e}")
-                elif args.dry_run:
-                    logger.info(f"DRY RUN: Would create {len(price_sets)} price sets")
-                else:
-                    logger.warning("Skipping price set creation as no GCP plans were discovered")
-
-            if args.create_service_plans:
-                service_plans_payloads = create_service_plans_from_skus(sku_processor)
+                # Build component price sets using current pricing data
                 if not args.dry_run:
-                    for service_plan in service_plans_payloads:
-                        try:
-                            # Idempotency: skip if service plan already exists
-                            existing = morpheus_api.get(f"service-plans?code={service_plan['code']}")
-                            if existing and existing.get('servicePlans'):
-                                logger.debug(f"Skipping existing service plan: {service_plan['code']}")
-                                continue
-                            morpheus_api.post("service-plans", service_plan)
-                            logger.info(f"Created service plan: {service_plan['name']}")
-                            time.sleep(0.05)
-                        except Exception as e:
-                            logger.error(f"Error creating service plan {service_plan['name']}: {e}")
+                    try:
+                        created_codes = create_component_price_sets(morpheus_api, sku_processor, pricing_data)
+                        logger.info(f"Created/updated {len(created_codes)} component price sets")
+                    except Exception as e:
+                        logger.error(f"Error creating component price sets: {e}")
                 else:
-                    logger.info(f"DRY RUN: Would create {len(service_plans_payloads)} service plans")
+                    logger.info("DRY RUN: Would create component price sets per family and region")
 
             # Optionally map created price sets to discovered plans
             if args.map_to_plans and not args.dry_run and discovered_plans:
@@ -650,11 +828,35 @@ def main():
                     # Refresh to get IDs
                     ps_resp = morpheus_api.get(f"price-sets?max=1000&phrase={PRICE_PREFIX}")
                     price_sets_list = ps_resp.get('priceSets', []) if ps_resp else []
-                    price_set_ids = [ps['id'] for ps in price_sets_list]
+                    price_set_map = {ps['code']: ps for ps in price_sets_list}
                     updated = 0
                     for plan in discovered_plans:
+                        # Extract region
+                        plan_region = None
+                        config = plan.get('config') or {}
+                        if config:
+                            plan_region = (config.get('zoneRegion') or config.get('region') or None)
+                            if not plan_region and config.get('availabilityZone'):
+                                parts = config['availabilityZone'].split('-')
+                                if len(parts) >= 2:
+                                    plan_region = '-'.join(parts[0:2])
+                        if not plan_region:
+                            logger.debug(f"Skipping plan '{plan.get('name','')}' - no region found")
+                            continue
+                        # Extract family
+                        name_lower = (plan.get('name') or '').lower()
+                        m = re.search(r'^(?:google-)?([a-z]\d+[a-z]?)-', name_lower)
+                        if not m:
+                            logger.debug(f"Skipping plan '{plan.get('name','')}' - no machine family parsed")
+                            continue
+                        family = m.group(1)
+                        expected_code = f"{PRICE_PREFIX.lower()}.gcp-{family}-{plan_region.replace('-', '_')}"
+                        ps = price_set_map.get(expected_code)
+                        if not ps:
+                            logger.debug(f"No matching price set for plan '{plan.get('name','')}' expecting '{expected_code}'")
+                            continue
                         current_ids = {ps['id'] for ps in (plan.get('priceSets') or []) if ps and 'id' in ps}
-                        final_ids = current_ids.union(price_set_ids)
+                        final_ids = current_ids.union({ps['id']})
                         payload = {"servicePlan": {"priceSets": [{"id": pid} for pid in final_ids]}}
                         resp = morpheus_api.put(f"service-plans/{plan['id']}", payload)
                         if resp and (resp.get('success') or resp.get('servicePlan')):
